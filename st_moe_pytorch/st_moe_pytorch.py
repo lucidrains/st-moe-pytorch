@@ -1,9 +1,13 @@
-import torch
-from torch import nn
-import torch.nn.functional as F
-
 import math
 from inspect import isfunction
+
+import torch
+from torch import nn, einsum
+import torch.nn.functional as F
+
+from einops import rearrange, repeat, pack, unpack
+
+from colt5_attention import topk as differentiable_topk
 
 # constants
 
@@ -44,22 +48,16 @@ def init_(t):
     std = 1 / math.sqrt(dim)
     return t.uniform_(-std, std)
 
-# activations
-
-class GELU_(nn.Module):
-    def forward(self, x):
-        return 0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
-
-GELU = nn.GELU if hasattr(nn, 'GELU') else GELU_
-
 # expert class
 
 class Experts(nn.Module):
-    def __init__(self,
+    def __init__(
+        self,
         dim,
         num_experts = 16,
         hidden_dim = None,
-        activation = GELU):
+        activation = nn.GELU
+    ):
         super().__init__()
 
         hidden_dim = default(hidden_dim, dim * 4)
@@ -76,9 +74,9 @@ class Experts(nn.Module):
         self.act = activation()
 
     def forward(self, x):
-        hidden = torch.einsum('...nd,...dh->...nh', x, self.w1)
+        hidden = einsum('... n d, ... d h -> ... n h', x, self.w1)
         hidden = self.act(hidden)
-        out    = torch.einsum('...nh,...hd->...nd', hidden, self.w2)
+        out    = einsum('... n h, ... h d -> ... n d', hidden, self.w2)
         return out
 
 # the below code is almost all transcribed from the official tensorflow version, from which the papers are written
@@ -125,7 +123,7 @@ class Top2Gating(nn.Module):
             threshold = self.second_threshold_eval
             capacity_factor = self.capacity_factor_eval
 
-        raw_gates = torch.einsum('...bnd,...de->...bne', x, self.w_gating)
+        raw_gates = einsum('... b n d, ... d e-> ... b n e', x, self.w_gating)
         raw_gates = raw_gates.softmax(dim=-1)
 
         # FIND TOP 2 EXPERTS PER POSITON
@@ -252,7 +250,7 @@ class MoE(nn.Module):
     def forward(self, inputs, **kwargs):
         b, n, d, e = *inputs.shape, self.num_experts
         dispatch_tensor, combine_tensor, loss = self.gate(inputs)
-        expert_inputs = torch.einsum('bnd,bnec->ebcd', inputs, dispatch_tensor)
+        expert_inputs = einsum('b n d, b n e c -> e b c d', inputs, dispatch_tensor)
 
         # Now feed the expert inputs through the experts.
         orig_shape = expert_inputs.shape
@@ -260,7 +258,7 @@ class MoE(nn.Module):
         expert_outputs = self.experts(expert_inputs)
         expert_outputs = expert_outputs.reshape(*orig_shape)
 
-        output = torch.einsum('ebcd,bnec->bnd', expert_outputs, combine_tensor)
+        output = einsum('e b c d, b n e c -> b n d', expert_outputs, combine_tensor)
         return output, loss * self.loss_coef
 
 # 2-level heirarchical mixture of experts
@@ -297,7 +295,7 @@ class HeirarchicalMoE(nn.Module):
     def forward(self, inputs, **kwargs):
         b, n, d, eo, ei = *inputs.shape, self.num_experts_outer, self.num_experts_inner
         dispatch_tensor_outer, combine_tensor_outer, loss_outer = self.gate_outer(inputs)
-        expert_inputs_outer = torch.einsum('bnd,bnec->ebcd', inputs, dispatch_tensor_outer)
+        expert_inputs_outer = einsum('b n d, b n e c -> e b c d', inputs, dispatch_tensor_outer)
 
         # we construct an "importance" Tensor for the inputs to the second-level
         # gating.  The importance of an input is 1.0 if it represents the
@@ -307,17 +305,18 @@ class HeirarchicalMoE(nn.Module):
         importance = 0.5 * ((importance > 0.5).float() + (importance > 0.).float())
 
         dispatch_tensor_inner, combine_tensor_inner, loss_inner = self.gate_inner(expert_inputs_outer, importance = importance)
-        expert_inputs = torch.einsum('ebnd,ebnfc->efbcd', expert_inputs_outer, dispatch_tensor_inner)
+        expert_inputs = einsum('e b n d, e b n f c -> e f b c d', expert_inputs_outer, dispatch_tensor_inner)
 
         # Now feed the expert inputs through the experts.
         orig_shape = expert_inputs.shape
-        expert_inputs = expert_inputs.reshape(eo, ei, -1, d)
+        expert_inputs, ps = pack([expert_inputs], 'o i * d')
         expert_outputs = self.experts(expert_inputs)
-        expert_outputs = expert_outputs.reshape(*orig_shape)
+        expert_outputs, = unpack(expert_outputs, ps, 'o i * d')
 
         # NOW COMBINE EXPERT OUTPUTS (reversing everything we have done)
         # expert_output has shape [y0, x1, h, d, n]
 
-        expert_outputs_outer = torch.einsum('efbcd,ebnfc->ebnd', expert_outputs, combine_tensor_inner)
-        output = torch.einsum('ebcd,bnec->bnd', expert_outputs_outer, combine_tensor_outer)
+        expert_outputs_outer = einsum('e f b c d, e b n f c -> e b n d', expert_outputs, combine_tensor_inner)
+        output = einsum('e b c d, b n e c -> b n d', expert_outputs_outer, combine_tensor_outer)
+
         return output, (loss_outer + loss_inner) * self.loss_coef
