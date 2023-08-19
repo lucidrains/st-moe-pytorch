@@ -53,6 +53,7 @@ out, aux_loss = moe(inputs) # (4, 1024, 512), (1,)
 ## Todo
 
 - [ ] add the router z-loss proposed in paper
+- [ ] add an entire sparse moe block, complete with rmsnorm + residual as well as the ability to specify a feedforward before or after for stability
 - [x] add the geglu expert with multiplicative gating
 
 ## Citations
