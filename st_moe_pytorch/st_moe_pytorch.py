@@ -7,7 +7,7 @@ from torch.nn import Module
 from torch import nn, einsum
 import torch.nn.functional as F
 
-from einops import rearrange, repeat, pack, unpack
+from einops import rearrange, repeat, reduce, pack, unpack
 
 from colt5_attention import topk as differentiable_topk
 
@@ -153,8 +153,8 @@ class Top2Gating(nn.Module):
             threshold = self.second_threshold_eval
             capacity_factor = self.capacity_factor_eval
 
-        raw_gates = einsum('... b n d, ... d e-> ... b n e', x, self.w_gating)
-        raw_gates = raw_gates.softmax(dim=-1)
+        gate_logits = einsum('... b n d, ... d e-> ... b n e', x, self.w_gating)
+        raw_gates = gate_logits.softmax(dim=-1)
 
         # FIND TOP 2 EXPERTS PER POSITON
         # Find the top expert for each position. shape=[batch, group]
@@ -250,7 +250,13 @@ class Top2Gating(nn.Module):
         )
 
         dispatch_tensor = combine_tensor.bool().to(combine_tensor)
-        return dispatch_tensor, combine_tensor, loss
+
+        # calculate the router z-loss proposed in paper
+
+        router_z_loss = torch.logsumexp(gate_logits, dim = -1)
+        router_z_loss = reduce(router_z_loss, '... n -> ...', 'sum')
+
+        return dispatch_tensor, combine_tensor, loss, router_z_loss.mean()
 
 # plain mixture of experts
 
@@ -267,6 +273,7 @@ class MoE(nn.Module):
         capacity_factor_train = 1.25,
         capacity_factor_eval = 2.,
         loss_coef = 1e-2,
+        router_z_loss_coef = 1e-3,
         experts = None
     ):
         super().__init__()
@@ -283,10 +290,12 @@ class MoE(nn.Module):
 
         self.gate = Top2Gating(dim, num_gates = num_experts, **gating_kwargs)
         self.experts = default(experts, lambda: Experts(dim, num_experts = num_experts, hidden_mult = expert_hidden_mult, dropout = expert_dropout))
+
         self.loss_coef = loss_coef
+        self.router_z_loss_coef = router_z_loss_coef
 
     def forward(self, inputs, **kwargs):
-        dispatch_tensor, combine_tensor, loss = self.gate(inputs)
+        dispatch_tensor, combine_tensor, loss, router_z_loss = self.gate(inputs)
         expert_inputs = einsum('b n d, b n e c -> e b c d', inputs, dispatch_tensor)
 
         # Now feed the expert inputs through the experts.
@@ -296,7 +305,7 @@ class MoE(nn.Module):
         expert_outputs, = unpack(expert_outputs, ps, 'e * d')
 
         output = einsum('e b c d, b n e c -> b n d', expert_outputs, combine_tensor)
-        return output, loss * self.loss_coef
+        return output, loss * self.loss_coef, router_z_loss * self.router_z_loss_coef
 
 # 2-level heirarchical mixture of experts
 
@@ -313,6 +322,7 @@ class HeirarchicalMoE(nn.Module):
         capacity_factor_train = 1.25,
         capacity_factor_eval = 2.,
         loss_coef = 1e-2,
+        router_z_loss_coef = 1e-3,
         experts = None
     ):
         super().__init__()
@@ -338,19 +348,21 @@ class HeirarchicalMoE(nn.Module):
         self.experts = nn.ModuleList([Experts(dim, num_experts = num_experts_inner, hidden_mult = expert_hidden_mult, dropout = expert_dropout) for _ in range(num_experts_outer)])
 
         self.loss_coef = loss_coef
+        self.router_z_loss_coef = router_z_loss_coef
 
     def forward(self, inputs, **kwargs):
-        dispatch_tensor_outer, combine_tensor_outer, loss_outer = self.gate_outer(inputs)
+        dispatch_tensor_outer, combine_tensor_outer, loss_outer, router_z_loss_outer = self.gate_outer(inputs)
         expert_inputs_outer = einsum('b n d, b n e c -> e b c d', inputs, dispatch_tensor_outer)
 
         # we construct an "importance" Tensor for the inputs to the second-level
         # gating.  The importance of an input is 1.0 if it represents the
         # first-choice expert-group and 0.5 if it represents the second-choice expert
         # group.  This is used by the second-level gating.
-        importance = combine_tensor_outer.permute(2, 0, 3, 1).sum(dim=-1)
+
+        importance = reduce(combine_tensor_outer, 'b n e c -> e b c', 'sum')
         importance = 0.5 * ((importance > 0.5).float() + (importance > 0.).float())
 
-        dispatch_tensor_inner, combine_tensor_inner, loss_inner = self.gate_inner(expert_inputs_outer, importance = importance)
+        dispatch_tensor_inner, combine_tensor_inner, loss_inner, router_z_loss_inner = self.gate_inner(expert_inputs_outer, importance = importance)
         expert_inputs = einsum('e b n d, e b n f c -> e f b c d', expert_inputs_outer, dispatch_tensor_inner)
 
         # Now feed the expert inputs through the experts.
@@ -371,4 +383,4 @@ class HeirarchicalMoE(nn.Module):
         expert_outputs_outer = einsum('e f b c d, e b n f c -> e b n d', expert_outputs, combine_tensor_inner)
         output = einsum('e b c d, b n e c -> b n d', expert_outputs_outer, combine_tensor_outer)
 
-        return output, (loss_outer + loss_inner) * self.loss_coef
+        return output, (loss_outer + loss_inner) * self.loss_coef, (router_z_loss_outer + router_z_loss_inner) * self.router_z_loss_coef
