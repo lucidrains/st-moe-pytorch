@@ -54,6 +54,8 @@ out, aux_loss = moe(inputs) # (4, 1024, 512), (1,)
 
 - [ ] add the router z-loss proposed in paper
 - [ ] add an entire sparse moe block, complete with rmsnorm + residual as well as the ability to specify a feedforward before or after for stability
+- [ ] offer an option to use differentiable topk (using coordinate descent algorithm, applied successfully in CoLT5)
+- [ ] use coordinate descent for top2 routing
 - [x] add the geglu expert with multiplicative gating
 
 ## Citations
