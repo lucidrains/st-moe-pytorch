@@ -16,7 +16,7 @@ setup(
     'mixture of experts'
   ],
   install_requires=[
-    'CoLT5-attention>=0.10',
+    'CoLT5-attention>=0.10.15',
     'einops>=0.6',
     'torch>=1.6',
   ],

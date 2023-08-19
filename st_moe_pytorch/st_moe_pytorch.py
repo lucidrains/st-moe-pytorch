@@ -1,7 +1,9 @@
 import math
 from inspect import isfunction
+from typing import Tuple
 
 import torch
+from torch.nn import Module
 from torch import nn, einsum
 import torch.nn.functional as F
 
@@ -15,9 +17,12 @@ MIN_EXPERT_CAPACITY = 4
 
 # helper functions
 
+def exists(val):
+    return val is not None
+
 def default(val, default_val):
-    default_val = default_val() if isfunction(default_val) else default_val
-    return val if val is not None else default_val
+    default_val = default_val() if callable(default_val) else default_val
+    return val if exists(val) else default_val
 
 def cast_tuple(el):
     return el if isinstance(el, tuple) else (el,)
@@ -25,11 +30,11 @@ def cast_tuple(el):
 # tensor related helper functions
 
 def top1(t):
-    values, index = t.topk(k=1, dim=-1)
+    values, index = t.topk(k = 1, dim = -1)
     values, index = map(lambda x: x.squeeze(dim=-1), (values, index))
     return values, index
 
-def cumsum_exclusive(t, dim=-1):
+def cumsum_exclusive(t, dim = -1):
     num_dims = len(t.shape)
     num_pad_dims = - dim - 1
     pre_padding = (0, 0) * num_pad_dims
@@ -39,45 +44,70 @@ def cumsum_exclusive(t, dim=-1):
 
 # pytorch one hot throws an error if there are out of bound indices.
 # tensorflow, in contrast, does not throw an error
+
 def safe_one_hot(indexes, max_length):
     max_index = indexes.max() + 1
     return F.one_hot(indexes, max(max_index + 1, max_length))[..., :max_length]
 
 def init_(t):
     dim = t.shape[-1]
-    std = 1 / math.sqrt(dim)
+    std = dim ** -0.5
     return t.uniform_(-std, std)
 
 # expert class
 
-class Experts(nn.Module):
+class GEGLU(Module):
+    def __init__(
+        self,
+        dim,
+        mult_bias = True
+    ):
+        super().__init__()
+        self.mult_bias = nn.Parameter(torch.ones(dim)) if mult_bias else 1.
+
+    def forward(self, x):
+        x, gate = x.chunk(2, dim = -1)
+        return F.gelu(gate) * x * self.mult_bias
+
+class Expert(Module):
+    def __init__(
+        self,
+        dim,
+        hidden_mult = 4,
+        mult_bias = True,
+        dropout = 0.,
+    ):
+        super().__init__()
+        dim_hidden = int(dim * hidden_mult * 2 / 3)
+
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim_hidden * 2),
+            GEGLU(dim_hidden, mult_bias = mult_bias),
+            nn.Dropout(dropout),
+            nn.Linear(dim_hidden, dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class Experts(Module):
     def __init__(
         self,
         dim,
         num_experts = 16,
-        hidden_dim = None,
-        activation = nn.GELU
+        hidden_mult = 4,
+        dropout = 0.
     ):
         super().__init__()
-
-        hidden_dim = default(hidden_dim, dim * 4)
-        num_experts = cast_tuple(num_experts)
-
-        w1 = torch.zeros(*num_experts, dim, hidden_dim)
-        w2 = torch.zeros(*num_experts, hidden_dim, dim)
-
-        w1 = init_(w1)
-        w2 = init_(w2)
-
-        self.w1 = nn.Parameter(w1)
-        self.w2 = nn.Parameter(w2)
-        self.act = activation()
+        self.experts = nn.ModuleList([Expert(dim = dim, hidden_mult = hidden_mult, dropout = dropout) for _ in range(num_experts)])
 
     def forward(self, x):
-        hidden = einsum('... n d, ... d h -> ... n h', x, self.w1)
-        hidden = self.act(hidden)
-        out    = einsum('... n h, ... h d -> ... n d', hidden, self.w2)
-        return out
+        outputs = []
+
+        for tokens, expert in zip(x, self.experts):
+            outputs.append(expert(tokens))
+
+        return torch.stack(outputs)
 
 # the below code is almost all transcribed from the official tensorflow version, from which the papers are written
 # https://github.com/tensorflow/tensor2tensor/blob/master/tensor2tensor/models/research/moe.py
@@ -133,7 +163,7 @@ class Top2Gating(nn.Module):
         mask_1 = F.one_hot(index_1, num_gates).float()
         density_1_proxy = raw_gates
 
-        if importance is not None:
+        if exists(importance):
             equals_one_mask = (importance == 1.).float()
             mask_1 *= equals_one_mask[..., None]
             gate_1 *= equals_one_mask
@@ -145,7 +175,7 @@ class Top2Gating(nn.Module):
         gate_2, index_2 = top1(gates_without_top_1)
         mask_2 = F.one_hot(index_2, num_gates).float()
 
-        if importance is not None:
+        if exists(importance):
             greater_zero_mask = (importance > 0.).float()
             mask_2 *= greater_zero_mask[..., None]
             del greater_zero_mask
@@ -228,8 +258,8 @@ class MoE(nn.Module):
     def __init__(self,
         dim,
         num_experts = 16,
-        hidden_dim = None,
-        activation = nn.ReLU,
+        expert_hidden_mult = 4,
+        expert_dropout = 0.,
         second_policy_train = 'random',
         second_policy_eval = 'random',
         second_threshold_train = 0.2,
@@ -237,26 +267,33 @@ class MoE(nn.Module):
         capacity_factor_train = 1.25,
         capacity_factor_eval = 2.,
         loss_coef = 1e-2,
-        experts = None):
+        experts = None
+    ):
         super().__init__()
-
         self.num_experts = num_experts
 
-        gating_kwargs = {'second_policy_train': second_policy_train, 'second_policy_eval': second_policy_eval, 'second_threshold_train': second_threshold_train, 'second_threshold_eval': second_threshold_eval, 'capacity_factor_train': capacity_factor_train, 'capacity_factor_eval': capacity_factor_eval}
+        gating_kwargs = dict(
+            second_policy_train = second_policy_train,
+            second_policy_eval = second_policy_eval,
+            second_threshold_train = second_threshold_train,
+            second_threshold_eval = second_threshold_eval,
+            capacity_factor_train = capacity_factor_train,
+            capacity_factor_eval = capacity_factor_eval
+        )
+
         self.gate = Top2Gating(dim, num_gates = num_experts, **gating_kwargs)
-        self.experts = default(experts, lambda: Experts(dim, num_experts = num_experts, hidden_dim = hidden_dim, activation = activation))
+        self.experts = default(experts, lambda: Experts(dim, num_experts = num_experts, hidden_mult = expert_hidden_mult, dropout = expert_dropout))
         self.loss_coef = loss_coef
 
     def forward(self, inputs, **kwargs):
-        b, n, d, e = *inputs.shape, self.num_experts
         dispatch_tensor, combine_tensor, loss = self.gate(inputs)
         expert_inputs = einsum('b n d, b n e c -> e b c d', inputs, dispatch_tensor)
 
         # Now feed the expert inputs through the experts.
-        orig_shape = expert_inputs.shape
-        expert_inputs = expert_inputs.reshape(e, -1, d)
+
+        expert_inputs, ps = pack([expert_inputs], 'e * d')
         expert_outputs = self.experts(expert_inputs)
-        expert_outputs = expert_outputs.reshape(*orig_shape)
+        expert_outputs, = unpack(expert_outputs, ps, 'e * d')
 
         output = einsum('e b c d, b n e c -> b n d', expert_outputs, combine_tensor)
         return output, loss * self.loss_coef
@@ -266,9 +303,9 @@ class MoE(nn.Module):
 class HeirarchicalMoE(nn.Module):
     def __init__(self,
         dim,
-        num_experts = (4, 4),
-        hidden_dim = None,
-        activation = nn.ReLU,
+        num_experts: Tuple[int, int] = (4, 4),
+        expert_hidden_mult = 4,
+        expert_dropout = 0.,
         second_policy_train = 'random',
         second_policy_eval = 'random',
         second_threshold_train = 0.2,
@@ -276,7 +313,8 @@ class HeirarchicalMoE(nn.Module):
         capacity_factor_train = 1.25,
         capacity_factor_eval = 2.,
         loss_coef = 1e-2,
-        experts = None):
+        experts = None
+    ):
         super().__init__()
 
         assert len(num_experts) == 2, 'only 2 levels of heirarchy for experts allowed for now'
@@ -284,16 +322,24 @@ class HeirarchicalMoE(nn.Module):
         self.num_experts_outer = num_experts_outer
         self.num_experts_inner = num_experts_inner
 
-        gating_kwargs = {'second_policy_train': second_policy_train, 'second_policy_eval': second_policy_eval, 'second_threshold_train': second_threshold_train, 'second_threshold_eval': second_threshold_eval, 'capacity_factor_train': capacity_factor_train, 'capacity_factor_eval': capacity_factor_eval}
+        gating_kwargs = dict(
+            second_policy_train = second_policy_train,
+            second_policy_eval = second_policy_eval,
+            second_threshold_train = second_threshold_train,
+            second_threshold_eval = second_threshold_eval,
+            capacity_factor_train = capacity_factor_train,
+            capacity_factor_eval = capacity_factor_eval
+        )
 
         self.gate_outer = Top2Gating(dim, num_gates = num_experts_outer, **gating_kwargs)
         self.gate_inner = Top2Gating(dim, num_gates = num_experts_inner, outer_expert_dims = (num_experts_outer,), **gating_kwargs)
 
-        self.experts = default(experts, lambda: Experts(dim, num_experts = num_experts, hidden_dim = hidden_dim, activation = activation))
+        num_experts_outer, num_experts_inner = num_experts
+        self.experts = nn.ModuleList([Experts(dim, num_experts = num_experts_inner, hidden_mult = expert_hidden_mult, dropout = expert_dropout) for _ in range(num_experts_outer)])
+
         self.loss_coef = loss_coef
 
     def forward(self, inputs, **kwargs):
-        b, n, d, eo, ei = *inputs.shape, self.num_experts_outer, self.num_experts_inner
         dispatch_tensor_outer, combine_tensor_outer, loss_outer = self.gate_outer(inputs)
         expert_inputs_outer = einsum('b n d, b n e c -> e b c d', inputs, dispatch_tensor_outer)
 
@@ -308,9 +354,15 @@ class HeirarchicalMoE(nn.Module):
         expert_inputs = einsum('e b n d, e b n f c -> e f b c d', expert_inputs_outer, dispatch_tensor_inner)
 
         # Now feed the expert inputs through the experts.
-        orig_shape = expert_inputs.shape
+
         expert_inputs, ps = pack([expert_inputs], 'o i * d')
-        expert_outputs = self.experts(expert_inputs)
+
+        expert_outputs = []
+
+        for inputs, hierarchy_experts in zip(expert_inputs, self.experts):
+            expert_outputs.append(hierarchy_experts(inputs))
+
+        expert_outputs = torch.stack(expert_outputs)
         expert_outputs, = unpack(expert_outputs, ps, 'o i * d')
 
         # NOW COMBINE EXPERT OUTPUTS (reversing everything we have done)
