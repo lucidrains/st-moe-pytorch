@@ -205,7 +205,6 @@ class Top2Gating(Module):
             mask_1 *= equals_one_mask[..., None]
             gate_1 *= equals_one_mask
             density_1_proxy = density_1_proxy * equals_one_mask[..., None]
-            del equals_one_mask
 
             gates_without_top_1 = raw_gates * (1. - mask_1)
 
@@ -317,8 +316,13 @@ class Top2Gating(Module):
 
         if self.training:
             router_z_loss = torch.logsumexp(gate_logits, dim = -1)
-            router_z_loss = reduce(router_z_loss, '... n -> ...', 'sum')
-            router_z_loss = router_z_loss.mean()
+            router_z_loss = torch.square(router_z_loss)
+
+            if exists(importance):
+                router_z_loss = router_z_loss * equals_one_mask
+                router_z_loss = router_z_loss.sum() / equals_one_mask.sum().clamp(min = 1e-5)
+            else:
+                router_z_loss = router_z_loss.mean()
         else:
             router_z_loss = self.zero
 
