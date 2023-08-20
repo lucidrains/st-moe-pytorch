@@ -94,7 +94,6 @@ class Expert(Module):
         dim,
         hidden_mult = 4,
         mult_bias = True,
-        dropout = 0.,
         prenorm = False
     ):
         super().__init__()
@@ -104,7 +103,6 @@ class Expert(Module):
             RMSNorm(dim) if prenorm else None,
             nn.Linear(dim, dim_hidden * 2),
             GEGLU(dim_hidden, mult_bias = mult_bias),
-            nn.Dropout(dropout),
             nn.Linear(dim_hidden, dim)
         )
 
@@ -126,11 +124,10 @@ class Experts(Module):
         self,
         dim,
         num_experts = 16,
-        hidden_mult = 4,
-        dropout = 0.
+        hidden_mult = 4
     ):
         super().__init__()
-        self.experts = ModuleList([Expert(dim = dim, hidden_mult = hidden_mult, dropout = dropout) for _ in range(num_experts)])
+        self.experts = ModuleList([Expert(dim = dim, hidden_mult = hidden_mult) for _ in range(num_experts)])
 
     def forward(self, x):
         outputs = []
@@ -308,7 +305,6 @@ class MoE(Module):
         dim,
         num_experts = 16,
         expert_hidden_mult = 4,
-        dropout = 0.,
         second_policy_train = 'random',
         second_policy_eval = 'random',
         second_threshold_train = 0.2,
@@ -333,7 +329,7 @@ class MoE(Module):
         )
 
         self.gate = Top2Gating(dim, num_gates = num_experts, **gating_kwargs)
-        self.experts = default(experts, lambda: Experts(dim, num_experts = num_experts, hidden_mult = expert_hidden_mult, dropout = dropout))
+        self.experts = default(experts, lambda: Experts(dim, num_experts = num_experts, hidden_mult = expert_hidden_mult))
 
         self.loss_coef = loss_coef
         self.router_z_loss_coef = router_z_loss_coef
@@ -370,7 +366,6 @@ class HeirarchicalMoE(Module):
         dim,
         num_experts: Tuple[int, int] = (4, 4),
         expert_hidden_mult = 4,
-        dropout = 0.,
         second_policy_train = 'random',
         second_policy_eval = 'random',
         second_threshold_train = 0.2,
@@ -403,7 +398,7 @@ class HeirarchicalMoE(Module):
         self.gate_inner = Top2Gating(dim, num_gates = num_experts_inner, outer_expert_dims = (num_experts_outer,), **gating_kwargs)
 
         num_experts_outer, num_experts_inner = num_experts
-        self.experts = ModuleList([Experts(dim, num_experts = num_experts_inner, hidden_mult = expert_hidden_mult, dropout = dropout) for _ in range(num_experts_outer)])
+        self.experts = ModuleList([Experts(dim, num_experts = num_experts_inner, hidden_mult = expert_hidden_mult) for _ in range(num_experts_outer)])
 
         self.loss_coef = loss_coef
         self.router_z_loss_coef = router_z_loss_coef
