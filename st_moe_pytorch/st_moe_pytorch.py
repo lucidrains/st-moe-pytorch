@@ -31,7 +31,7 @@ def cast_tuple(el):
 
 def top1(t):
     values, index = t.topk(k = 1, dim = -1)
-    values, index = map(lambda x: x.squeeze(dim=-1), (values, index))
+    values, index = map(lambda x: rearrange(x, '... 1 -> ...'), (values, index))
     return values, index
 
 def cumsum_exclusive(t, dim = -1):
@@ -39,7 +39,7 @@ def cumsum_exclusive(t, dim = -1):
     num_pad_dims = - dim - 1
     pre_padding = (0, 0) * num_pad_dims
     pre_slice   = (slice(None),) * num_pad_dims
-    padded_t = F.pad(t, (*pre_padding, 1, 0)).cumsum(dim=dim)
+    padded_t = F.pad(t, (*pre_padding, 1, 0)).cumsum(dim = dim)
     return padded_t[(..., slice(None, -1), *pre_slice)]
 
 # pytorch one hot throws an error if there are out of bound indices.
@@ -48,11 +48,6 @@ def cumsum_exclusive(t, dim = -1):
 def safe_one_hot(indexes, max_length):
     max_index = indexes.max() + 1
     return F.one_hot(indexes, max(max_index + 1, max_length))[..., :max_length]
-
-def init_(t):
-    dim = t.shape[-1]
-    std = dim ** -0.5
-    return t.uniform_(-std, std)
 
 # expert class
 
@@ -86,6 +81,16 @@ class Expert(Module):
             nn.Dropout(dropout),
             nn.Linear(dim_hidden, dim)
         )
+
+        self.apply(self.init_)
+
+    def init_(self, module):
+        if isinstance(module, nn.Linear):
+            dim = module.weight.shape[0]
+            std = dim ** -0.5
+
+            module.weight.data.uniform_(-std, std)
+            module.bias.data.uniform_(-std, std)
 
     def forward(self, x):
         return self.net(x)
@@ -153,7 +158,7 @@ class Top2Gating(nn.Module):
             threshold = self.second_threshold_eval
             capacity_factor = self.capacity_factor_eval
 
-        gate_logits = einsum('... b n d, ... d e-> ... b n e', x, self.w_gating)
+        gate_logits = einsum('... b n d, ... d e -> ... b n e', x, self.w_gating)
         raw_gates = gate_logits.softmax(dim=-1)
 
         # FIND TOP 2 EXPERTS PER POSITON
@@ -326,8 +331,8 @@ class HeirarchicalMoE(nn.Module):
         experts = None
     ):
         super().__init__()
-
         assert len(num_experts) == 2, 'only 2 levels of heirarchy for experts allowed for now'
+
         num_experts_outer, num_experts_inner = num_experts
         self.num_experts_outer = num_experts_outer
         self.num_experts_inner = num_experts_inner
