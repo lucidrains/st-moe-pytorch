@@ -154,7 +154,8 @@ class Top2Gating(Module):
         second_threshold_train = 0.2,
         second_threshold_eval = 0.2,
         capacity_factor_train = 1.25,
-        capacity_factor_eval = 2.
+        capacity_factor_eval = 2.,
+        detached_dispatch_tensor = True
     ):
         super().__init__()
         self.eps = eps
@@ -168,6 +169,7 @@ class Top2Gating(Module):
         self.capacity_factor_train = capacity_factor_train
         self.capacity_factor_eval = capacity_factor_eval        
 
+        self.detached_dispatch_tensor = detached_dispatch_tensor
         self.register_buffer('zero', torch.zeros((1,)), persistent = False)
 
     def forward(
@@ -304,7 +306,12 @@ class Top2Gating(Module):
             * safe_one_hot(position_in_expert_2.long(), expert_capacity)[..., N, :]
         )
 
+        # dispatch tensor
+
         dispatch_tensor = combine_tensor.bool().type(dtype)
+
+        if not self.detached_dispatch_tensor:
+            dispatch_tensor = dispatch_tensor + combine_tensor - combine_tensor.detach()
 
         # calculate the router z-loss proposed in paper
 
@@ -332,7 +339,8 @@ class MoE(Module):
         capacity_factor_eval = 2.,
         loss_coef = 1e-2,
         router_z_loss_coef = 1e-3,
-        experts: Optional[Module] = None
+        experts: Optional[Module] = None,
+        detached_dispatch_tensor = True
     ):
         super().__init__()
         self.dim = dim
@@ -347,7 +355,13 @@ class MoE(Module):
             capacity_factor_eval = capacity_factor_eval
         )
 
-        self.gate = Top2Gating(dim, num_gates = num_experts, **gating_kwargs)
+        self.gate = Top2Gating(
+            dim,
+            num_gates = num_experts,
+            detached_dispatch_tensor = detached_dispatch_tensor,
+            **gating_kwargs
+        )
+
         self.experts = default(experts, lambda: Experts(dim, num_experts = num_experts, hidden_mult = expert_hidden_mult))
 
         self.loss_coef = loss_coef
@@ -393,6 +407,7 @@ class HeirarchicalMoE(Module):
         capacity_factor_eval = 2.,
         loss_coef = 1e-2,
         router_z_loss_coef = 1e-3,
+        detached_dispatch_tensor = True,
         experts: Optional[Module] = None
     ):
         super().__init__()
@@ -413,8 +428,20 @@ class HeirarchicalMoE(Module):
             capacity_factor_eval = capacity_factor_eval
         )
 
-        self.gate_outer = Top2Gating(dim, num_gates = num_experts_outer, **gating_kwargs)
-        self.gate_inner = Top2Gating(dim, num_gates = num_experts_inner, outer_expert_dims = (num_experts_outer,), **gating_kwargs)
+        self.gate_outer = Top2Gating(
+            dim,
+            num_gates = num_experts_outer,
+            detached_dispatch_tensor = detached_dispatch_tensor,
+            **gating_kwargs
+        )
+
+        self.gate_inner = Top2Gating(
+            dim,
+            num_gates = num_experts_inner,
+            detached_dispatch_tensor = detached_dispatch_tensor,
+            outer_expert_dims = (num_experts_outer,),
+            **gating_kwargs
+        )
 
         num_experts_outer, num_experts_inner = num_experts
         self.experts = ModuleList([Experts(dim, num_experts = num_experts_inner, hidden_mult = expert_hidden_mult) for _ in range(num_experts_outer)])
