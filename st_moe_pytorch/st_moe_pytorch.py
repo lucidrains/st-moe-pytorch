@@ -193,40 +193,49 @@ class Top2Gating(Module):
         # FIND TOP 2 EXPERTS PER POSITON
         # Find the top expert for each position. shape=[batch, group]
 
-        gate_1, index_1 = top1(raw_gates)
-        mask_1 = F.one_hot(index_1, num_gates).float()
         density_1_proxy = raw_gates
 
         if exists(importance):
+            gate_1, index_1 = top1(raw_gates)
+            mask_1 = F.one_hot(index_1, num_gates).float()
+
             equals_one_mask = (importance == 1.).float()
             mask_1 *= equals_one_mask[..., None]
             gate_1 *= equals_one_mask
             density_1_proxy = density_1_proxy * equals_one_mask[..., None]
             del equals_one_mask
 
-        gates_without_top_1 = raw_gates * (1. - mask_1)
+            gates_without_top_1 = raw_gates * (1. - mask_1)
 
-        gate_2, index_2 = top1(gates_without_top_1)
-        mask_2 = F.one_hot(index_2, num_gates).float()
+            gate_2, index_2 = top1(gates_without_top_1)
+            mask_2 = F.one_hot(index_2, num_gates).float()
 
-        if exists(importance):
             greater_zero_mask = (importance > 0.).float()
             mask_2 *= greater_zero_mask[..., None]
             del greater_zero_mask
 
+        else:
+            topk_raw_gates_values, topk_raw_gates_indices = raw_gates.topk(k = 2, dim = -1)
+
+            gate_1, gate_2 = topk_raw_gates_values.unbind(dim = -1)
+            index_1, index_2 = topk_raw_gates_indices.unbind(dim = -1)
+
+            mask_1 = F.one_hot(index_1, num_gates).float()
+            mask_2 = F.one_hot(index_2, num_gates).float()
+
         # normalize top2 gate scores
 
         denom = gate_1 + gate_2 + self.eps
-        gate_1 /= denom
-        gate_2 /= denom
+        gate_1 = gate_1 / denom
+        gate_2 = gate_2 / denom
 
         # BALANCING LOSSES
         # shape = [batch, experts]
         # We want to equalize the fraction of the batch assigned to each expert
 
-        density_1 = reduce(mask_1, 'b n e -> b e', 'mean')
+        density_1 = reduce(mask_1, '... n e -> ... e', 'mean')
         # Something continuous that is correlated with what we want to equalize.
-        density_1_proxy = reduce(density_1_proxy, 'b n e -> b e', 'mean')
+        density_1_proxy = reduce(density_1_proxy, '... n e -> ... e', 'mean')
 
         if self.training:
             balance_loss = (density_1_proxy * density_1).mean() * float(num_gates ** 2)
@@ -264,20 +273,20 @@ class Top2Gating(Module):
         mask_1 *= (position_in_expert_1 < expert_capacity_f).float()
         # [batch, experts]
         # How many examples in this sequence go to this expert
-        mask_1_count = reduce(mask_1, 'b n e -> b 1 e', 'mean')
+        mask_1_count = reduce(mask_1, '... n e -> ... 1 e', 'mean')
         # [batch, group] - mostly ones, but zeros where something didn't fit
-        mask_1_flat = reduce(mask_1, 'b n e -> b n', 'sum')
+        mask_1_flat = reduce(mask_1, '... n e -> ... n', 'sum')
         # [batch, group]
-        position_in_expert_1 = reduce(position_in_expert_1, 'b n e -> b n', 'sum')
+        position_in_expert_1 = reduce(position_in_expert_1, '... n e -> ... n', 'sum')
         # Weight assigned to first expert.  [batch, group]
         gate_1 *= mask_1_flat
 
         position_in_expert_2 = cumsum_exclusive(mask_2) + mask_1_count
         position_in_expert_2 *= mask_2
         mask_2 *= (position_in_expert_2 < expert_capacity_f).float()
-        mask_2_flat = reduce(mask_2, 'b n e -> b n', 'sum')
+        mask_2_flat = reduce(mask_2, '... n e -> ... n', 'sum')
 
-        position_in_expert_2 = reduce(position_in_expert_2, 'b n e -> b n', 'sum')
+        position_in_expert_2 = reduce(position_in_expert_2, '... n e -> ... n', 'sum')
         gate_2 *= mask_2_flat
         
         # [batch, group, experts, expert_capacity]
