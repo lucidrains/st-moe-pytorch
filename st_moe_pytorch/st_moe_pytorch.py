@@ -1,6 +1,7 @@
 import math
+from functools import partial
 from inspect import isfunction
-from typing import Tuple, Union
+from typing import Tuple, Union, Optional
 
 import torch
 from torch.nn import Module, ModuleList
@@ -41,17 +42,16 @@ def Sequential(*modules):
 # tensor related helper functions
 
 def top1(t):
-    values, index = t.topk(k = 1, dim = -1)
-    values, index = map(lambda x: rearrange(x, '... 1 -> ...'), (values, index))
-    return values, index
+    topk_return = t.topk(k = 1)
+    values = rearrange(topk_return.values, '... 1 -> ...')
+    indices = rearrange(topk_return.indices, '... 1 -> ...')
+    return values, indices
 
-def cumsum_exclusive(t, dim = -1):
+def cumsum_exclusive(t, dim = -2):
     num_dims = len(t.shape)
     num_pad_dims = - dim - 1
     pre_padding = (0, 0) * num_pad_dims
-    pre_slice   = (slice(None),) * num_pad_dims
-    padded_t = F.pad(t, (*pre_padding, 1, 0)).cumsum(dim = dim)
-    return padded_t[(..., slice(None, -1), *pre_slice)]
+    return F.pad(t, (*pre_padding, 1, -1)).cumsum(dim = dim)
 
 # pytorch one hot throws an error if there are out of bound indices.
 # tensorflow, in contrast, does not throw an error
@@ -157,7 +157,6 @@ class Top2Gating(Module):
         capacity_factor_eval = 2.
     ):
         super().__init__()
-
         self.eps = eps
         self.num_gates = num_gates
         self.w_gating = nn.Parameter(torch.randn(*outer_expert_dims, dim, num_gates))
@@ -167,25 +166,29 @@ class Top2Gating(Module):
         self.second_threshold_train = second_threshold_train
         self.second_threshold_eval = second_threshold_eval
         self.capacity_factor_train = capacity_factor_train
-        self.capacity_factor_eval = capacity_factor_eval
+        self.capacity_factor_eval = capacity_factor_eval        
 
         self.register_buffer('zero', torch.zeros((1,)), persistent = False)
 
-    def forward(self, x, importance = None):
-        *_, b, group_size, dim = x.shape
-        num_gates = self.num_gates
+    def forward(
+        self,
+        x,
+        importance = None
+    ):
+        *_, b, group_size, dim, dtype, num_gates = *x.shape, x.dtype, self.num_gates
 
-        if self.training:
-            policy = self.second_policy_train
-            threshold = self.second_threshold_train
-            capacity_factor = self.capacity_factor_train
-        else:
-            policy = self.second_policy_eval
-            threshold = self.second_threshold_eval
-            capacity_factor = self.capacity_factor_eval
+        # policy, threshold, capacity depending on training or eval
+
+        suffix = 'train' if self.training else 'eval'
+
+        policy = getattr(self, f'second_policy_{suffix}')
+        threshold = getattr(self, f'second_threshold_{suffix}')
+        capacity_factor = getattr(self, f'capacity_factor_{suffix}')
+
+        # logits and gates
 
         gate_logits = einsum('... b n d, ... d e -> ... b n e', x, self.w_gating)
-        raw_gates = gate_logits.softmax(dim=-1)
+        raw_gates = gate_logits.softmax(dim = -1)
 
         # FIND TOP 2 EXPERTS PER POSITON
         # Find the top expert for each position. shape=[batch, group]
@@ -212,6 +215,7 @@ class Top2Gating(Module):
             del greater_zero_mask
 
         # normalize top2 gate scores
+
         denom = gate_1 + gate_2 + self.eps
         gate_1 /= denom
         gate_2 /= denom
@@ -219,9 +223,10 @@ class Top2Gating(Module):
         # BALANCING LOSSES
         # shape = [batch, experts]
         # We want to equalize the fraction of the batch assigned to each expert
-        density_1 = mask_1.mean(dim=-2)
+
+        density_1 = reduce(mask_1, 'b n e -> b e', 'mean')
         # Something continuous that is correlated with what we want to equalize.
-        density_1_proxy = density_1_proxy.mean(dim=-2)
+        density_1_proxy = reduce(density_1_proxy, 'b n e -> b e', 'mean')
 
         if self.training:
             balance_loss = (density_1_proxy * density_1).mean() * float(num_gates ** 2)
@@ -245,6 +250,7 @@ class Top2Gating(Module):
 
         # Each sequence sends (at most?) expert_capacity positions to each expert.
         # Static expert_capacity dimension is needed for expert batch sizes
+
         expert_capacity = min(group_size, int((group_size * capacity_factor) / num_gates))
         expert_capacity = max(expert_capacity, MIN_EXPERT_CAPACITY)
         expert_capacity_f = float(expert_capacity)
@@ -252,40 +258,44 @@ class Top2Gating(Module):
         # COMPUTE ASSIGNMENT TO EXPERTS
         # [batch, group, experts]
         # This is the position within the expert's mini-batch for this sequence
-        position_in_expert_1 = cumsum_exclusive(mask_1, dim=-2) * mask_1
+
+        position_in_expert_1 = cumsum_exclusive(mask_1) * mask_1
         # Remove the elements that don't fit. [batch, group, experts]
         mask_1 *= (position_in_expert_1 < expert_capacity_f).float()
         # [batch, experts]
         # How many examples in this sequence go to this expert
-        mask_1_count = mask_1.sum(dim=-2, keepdim=True)
+        mask_1_count = reduce(mask_1, 'b n e -> b 1 e', 'mean')
         # [batch, group] - mostly ones, but zeros where something didn't fit
-        mask_1_flat = mask_1.sum(dim=-1)
+        mask_1_flat = reduce(mask_1, 'b n e -> b n', 'sum')
         # [batch, group]
-        position_in_expert_1 = position_in_expert_1.sum(dim=-1)
+        position_in_expert_1 = reduce(position_in_expert_1, 'b n e -> b n', 'sum')
         # Weight assigned to first expert.  [batch, group]
         gate_1 *= mask_1_flat
 
-        position_in_expert_2 = cumsum_exclusive(mask_2, dim=-2) + mask_1_count
+        position_in_expert_2 = cumsum_exclusive(mask_2) + mask_1_count
         position_in_expert_2 *= mask_2
         mask_2 *= (position_in_expert_2 < expert_capacity_f).float()
-        mask_2_flat = mask_2.sum(dim=-1)
+        mask_2_flat = reduce(mask_2, 'b n e -> b n', 'sum')
 
-        position_in_expert_2 = position_in_expert_2.sum(dim=-1)
+        position_in_expert_2 = reduce(position_in_expert_2, 'b n e -> b n', 'sum')
         gate_2 *= mask_2_flat
         
         # [batch, group, experts, expert_capacity]
+
+        N = None
+
         combine_tensor = (
-            gate_1[..., None, None]
-            * mask_1_flat[..., None, None]
-            * F.one_hot(index_1, num_gates)[..., None]
-            * safe_one_hot(position_in_expert_1.long(), expert_capacity)[..., None, :] +
-            gate_2[..., None, None]
-            * mask_2_flat[..., None, None]
-            * F.one_hot(index_2, num_gates)[..., None]
-            * safe_one_hot(position_in_expert_2.long(), expert_capacity)[..., None, :]
+            gate_1[..., N, N]
+            * mask_1_flat[..., N, N]
+            * F.one_hot(index_1, num_gates)[..., N]
+            * safe_one_hot(position_in_expert_1.long(), expert_capacity)[..., N, :] +
+            gate_2[..., N, N]
+            * mask_2_flat[..., N, N]
+            * F.one_hot(index_2, num_gates)[..., N]
+            * safe_one_hot(position_in_expert_2.long(), expert_capacity)[..., N, :]
         )
 
-        dispatch_tensor = combine_tensor.bool().to(combine_tensor)
+        dispatch_tensor = combine_tensor.bool().type(dtype)
 
         # calculate the router z-loss proposed in paper
 
@@ -313,7 +323,7 @@ class MoE(Module):
         capacity_factor_eval = 2.,
         loss_coef = 1e-2,
         router_z_loss_coef = 1e-3,
-        experts = None
+        experts: Optional[Module] = None
     ):
         super().__init__()
         self.dim = dim
@@ -374,7 +384,7 @@ class HeirarchicalMoE(Module):
         capacity_factor_eval = 2.,
         loss_coef = 1e-2,
         router_z_loss_coef = 1e-3,
-        experts = None
+        experts: Optional[Module] = None
     ):
         super().__init__()
         assert len(num_experts) == 2, 'only 2 levels of heirarchy for experts allowed for now'

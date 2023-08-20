@@ -56,11 +56,9 @@ out, aux_loss, router_z_loss = moe(inputs) # (4, 1024, 512), (1,), (1,)
 - [x] add the geglu expert with multiplicative gating
 - [x] add an entire sparse moe block, complete with rmsnorm + residual as well as the ability to specify a feedforward before or after for stability
 - [x] double check equation for router z-loss for experts inner in hierarchical moe
+- [x] redo all the transcribed code from google with einops, as it is not very clear
 
-- [ ] offer an option to use differentiable topk (using coordinate descent algorithm, applied successfully in CoLT5)
-- [ ] use coordinate descent for top2 routing
-- [ ] add the batched prioritized routing logic (works better when capacity factor is less than 1.2)
-- [ ] redo all the transcribed code from google with einops, as it is not very clear
+- [ ] improvise a `Top2GatingWithCoordinateDescent` for `MoE` without `importance`
 - [ ] take care of scatter gather, and once done, port over to <a href="https://github.com/lucidrains/soft-moe-pytorch">soft moe</a>
 
 ## Citations
