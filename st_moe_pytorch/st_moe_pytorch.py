@@ -3,7 +3,7 @@ from inspect import isfunction
 from typing import Tuple, Union
 
 import torch
-from torch.nn import Module
+from torch.nn import Module, ModuleList
 from torch import nn, einsum
 import torch.nn.functional as F
 
@@ -28,6 +28,12 @@ def default(val, default):
 
 def cast_tuple(el):
     return el if isinstance(el, tuple) else (el,)
+
+def pack_one(t, pattern):
+    return pack([t], pattern)
+
+def unpack_one(t, ps, pattern):
+    return unpack(t, ps, pattern)[0]
 
 def Sequential(*modules):
     return nn.Sequential(*filter(exists, modules))
@@ -124,7 +130,7 @@ class Experts(Module):
         dropout = 0.
     ):
         super().__init__()
-        self.experts = nn.ModuleList([Expert(dim = dim, hidden_mult = hidden_mult, dropout = dropout) for _ in range(num_experts)])
+        self.experts = ModuleList([Expert(dim = dim, hidden_mult = hidden_mult, dropout = dropout) for _ in range(num_experts)])
 
     def forward(self, x):
         outputs = []
@@ -139,7 +145,7 @@ class Experts(Module):
 
 # gating network
 
-class Top2Gating(nn.Module):
+class Top2Gating(Module):
     def __init__(
         self,
         dim,
@@ -165,6 +171,8 @@ class Top2Gating(nn.Module):
         self.second_threshold_eval = second_threshold_eval
         self.capacity_factor_train = capacity_factor_train
         self.capacity_factor_eval = capacity_factor_eval
+
+        self.register_buffer('zero', torch.zeros((1,)), persistent = False)
 
     def forward(self, x, importance = None):
         *_, b, group_size, dim = x.shape
@@ -217,7 +225,11 @@ class Top2Gating(nn.Module):
         density_1 = mask_1.mean(dim=-2)
         # Something continuous that is correlated with what we want to equalize.
         density_1_proxy = density_1_proxy.mean(dim=-2)
-        balance_loss = (density_1_proxy * density_1).mean() * float(num_gates ** 2)
+
+        if self.training:
+            balance_loss = (density_1_proxy * density_1).mean() * float(num_gates ** 2)
+        else:
+            balance_loss = self.zero
 
         # Depending on the policy in the hparams, we may drop out some of the
         # second-place experts.
@@ -280,15 +292,18 @@ class Top2Gating(nn.Module):
 
         # calculate the router z-loss proposed in paper
 
-        router_z_loss = torch.logsumexp(gate_logits, dim = -1)
-        router_z_loss = reduce(router_z_loss, '... n -> ...', 'sum')
-        router_z_loss = router_z_loss.mean()
+        if self.training:
+            router_z_loss = torch.logsumexp(gate_logits, dim = -1)
+            router_z_loss = reduce(router_z_loss, '... n -> ...', 'sum')
+            router_z_loss = router_z_loss.mean()
+        else:
+            router_z_loss = self.zero
 
         return dispatch_tensor, combine_tensor, balance_loss, router_z_loss
 
 # plain mixture of experts
 
-class MoE(nn.Module):
+class MoE(Module):
     def __init__(self,
         dim,
         num_experts = 16,
@@ -325,20 +340,31 @@ class MoE(nn.Module):
 
     def forward(self, inputs, **kwargs):
         dispatch_tensor, combine_tensor, loss, router_z_loss = self.gate(inputs)
+
+        # dispatch
+
         expert_inputs = einsum('b n d, b n e c -> e b c d', inputs, dispatch_tensor)
 
-        # Now feed the expert inputs through the experts.
+        # feed the expert inputs through the experts.
 
-        expert_inputs, ps = pack([expert_inputs], 'e * d')
+        expert_inputs, ps = pack_one(expert_inputs, 'e * d')
         expert_outputs = self.experts(expert_inputs)
-        expert_outputs, = unpack(expert_outputs, ps, 'e * d')
+        expert_outputs = unpack_one(expert_outputs, ps, 'e * d')
+
+        # combine
 
         output = einsum('e b c d, b n e c -> b n d', expert_outputs, combine_tensor)
-        return output, loss * self.loss_coef, router_z_loss * self.router_z_loss_coef
+
+        # losses
+
+        balance_loss = loss * self.loss_coef
+        router_z_loss = router_z_loss * self.router_z_loss_coef
+
+        return output, balance_loss, router_z_loss
 
 # 2-level heirarchical mixture of experts
 
-class HeirarchicalMoE(nn.Module):
+class HeirarchicalMoE(Module):
     def __init__(
         self,
         dim,
@@ -377,7 +403,7 @@ class HeirarchicalMoE(nn.Module):
         self.gate_inner = Top2Gating(dim, num_gates = num_experts_inner, outer_expert_dims = (num_experts_outer,), **gating_kwargs)
 
         num_experts_outer, num_experts_inner = num_experts
-        self.experts = nn.ModuleList([Experts(dim, num_experts = num_experts_inner, hidden_mult = expert_hidden_mult, dropout = dropout) for _ in range(num_experts_outer)])
+        self.experts = ModuleList([Experts(dim, num_experts = num_experts_inner, hidden_mult = expert_hidden_mult, dropout = dropout) for _ in range(num_experts_outer)])
 
         self.loss_coef = loss_coef
         self.router_z_loss_coef = router_z_loss_coef
@@ -399,7 +425,7 @@ class HeirarchicalMoE(nn.Module):
 
         # Now feed the expert inputs through the experts.
 
-        expert_inputs, ps = pack([expert_inputs], 'o i * d')
+        expert_inputs, ps = pack_one(expert_inputs, 'o i * d')
 
         expert_outputs = []
 
@@ -407,7 +433,7 @@ class HeirarchicalMoE(nn.Module):
             expert_outputs.append(hierarchy_experts(inputs))
 
         expert_outputs = torch.stack(expert_outputs)
-        expert_outputs, = unpack(expert_outputs, ps, 'o i * d')
+        expert_outputs = unpack_one(expert_outputs, ps, 'o i * d')
 
         # NOW COMBINE EXPERT OUTPUTS (reversing everything we have done)
         # expert_output has shape [y0, x1, h, d, n]

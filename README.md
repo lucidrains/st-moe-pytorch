@@ -60,6 +60,7 @@ out, aux_loss, router_z_loss = moe(inputs) # (4, 1024, 512), (1,), (1,)
 - [ ] offer an option to use differentiable topk (using coordinate descent algorithm, applied successfully in CoLT5)
 - [ ] use coordinate descent for top2 routing
 - [ ] redo all the transcribed code from google with einops, as it is not very clear
+- [ ] take care of scatter gather, and once done, port over to <a href="https://github.com/lucidrains/soft-moe-pytorch">soft moe</a>
 
 ## Citations
 
