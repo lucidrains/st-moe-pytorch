@@ -1,6 +1,6 @@
 import math
 from inspect import isfunction
-from typing import Tuple
+from typing import Tuple, Union
 
 import torch
 from torch.nn import Module
@@ -20,12 +20,17 @@ MIN_EXPERT_CAPACITY = 4
 def exists(val):
     return val is not None
 
-def default(val, default_val):
-    default_val = default_val() if callable(default_val) else default_val
-    return val if exists(val) else default_val
+def default(val, default):
+    if exists(val):
+        return val
+
+    return default() if callable(default) else default
 
 def cast_tuple(el):
     return el if isinstance(el, tuple) else (el,)
+
+def Sequential(*modules):
+    return nn.Sequential(*filter(exists, modules))
 
 # tensor related helper functions
 
@@ -47,9 +52,22 @@ def cumsum_exclusive(t, dim = -1):
 
 def safe_one_hot(indexes, max_length):
     max_index = indexes.max() + 1
-    return F.one_hot(indexes, max(max_index + 1, max_length))[..., :max_length]
+    one_hot_classes = max(max_index + 1, max_length)
+    return F.one_hot(indexes, one_hot_classes)[..., :max_length]
+
+# rms normalization
+
+class RMSNorm(Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.scale = dim ** 0.5
+        self.gamma = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        return F.normalize(x, dim = -1) * self.gamma * self.scale
 
 # expert class
+# best performing was ff geglu with multiplicative bias (just after gating)
 
 class GEGLU(Module):
     def __init__(
@@ -71,11 +89,13 @@ class Expert(Module):
         hidden_mult = 4,
         mult_bias = True,
         dropout = 0.,
+        prenorm = False
     ):
         super().__init__()
         dim_hidden = int(dim * hidden_mult * 2 / 3)
 
-        self.net = nn.Sequential(
+        self.net = Sequential(
+            RMSNorm(dim) if prenorm else None,
             nn.Linear(dim, dim_hidden * 2),
             GEGLU(dim_hidden, mult_bias = mult_bias),
             nn.Dropout(dropout),
@@ -125,13 +145,14 @@ class Top2Gating(nn.Module):
         dim,
         num_gates,
         eps = 1e-9,
-        outer_expert_dims = tuple(),
+        outer_expert_dims: Tuple[int, ...] = tuple(),
         second_policy_train = 'random',
         second_policy_eval = 'random',
         second_threshold_train = 0.2,
         second_threshold_eval = 0.2,
         capacity_factor_train = 1.25,
-        capacity_factor_eval = 2.):
+        capacity_factor_eval = 2.
+    ):
         super().__init__()
 
         self.eps = eps
@@ -196,10 +217,11 @@ class Top2Gating(nn.Module):
         density_1 = mask_1.mean(dim=-2)
         # Something continuous that is correlated with what we want to equalize.
         density_1_proxy = density_1_proxy.mean(dim=-2)
-        loss = (density_1_proxy * density_1).mean() * float(num_gates ** 2)
+        balance_loss = (density_1_proxy * density_1).mean() * float(num_gates ** 2)
 
         # Depending on the policy in the hparams, we may drop out some of the
         # second-place experts.
+
         if policy == "all":
             pass
         elif policy == "none":
@@ -260,8 +282,9 @@ class Top2Gating(nn.Module):
 
         router_z_loss = torch.logsumexp(gate_logits, dim = -1)
         router_z_loss = reduce(router_z_loss, '... n -> ...', 'sum')
+        router_z_loss = router_z_loss.mean()
 
-        return dispatch_tensor, combine_tensor, loss, router_z_loss.mean()
+        return dispatch_tensor, combine_tensor, balance_loss, router_z_loss
 
 # plain mixture of experts
 
@@ -270,7 +293,7 @@ class MoE(nn.Module):
         dim,
         num_experts = 16,
         expert_hidden_mult = 4,
-        expert_dropout = 0.,
+        dropout = 0.,
         second_policy_train = 'random',
         second_policy_eval = 'random',
         second_threshold_train = 0.2,
@@ -282,6 +305,7 @@ class MoE(nn.Module):
         experts = None
     ):
         super().__init__()
+        self.dim = dim
         self.num_experts = num_experts
 
         gating_kwargs = dict(
@@ -294,7 +318,7 @@ class MoE(nn.Module):
         )
 
         self.gate = Top2Gating(dim, num_gates = num_experts, **gating_kwargs)
-        self.experts = default(experts, lambda: Experts(dim, num_experts = num_experts, hidden_mult = expert_hidden_mult, dropout = expert_dropout))
+        self.experts = default(experts, lambda: Experts(dim, num_experts = num_experts, hidden_mult = expert_hidden_mult, dropout = dropout))
 
         self.loss_coef = loss_coef
         self.router_z_loss_coef = router_z_loss_coef
@@ -315,11 +339,12 @@ class MoE(nn.Module):
 # 2-level heirarchical mixture of experts
 
 class HeirarchicalMoE(nn.Module):
-    def __init__(self,
+    def __init__(
+        self,
         dim,
         num_experts: Tuple[int, int] = (4, 4),
         expert_hidden_mult = 4,
-        expert_dropout = 0.,
+        dropout = 0.,
         second_policy_train = 'random',
         second_policy_eval = 'random',
         second_threshold_train = 0.2,
@@ -332,6 +357,8 @@ class HeirarchicalMoE(nn.Module):
     ):
         super().__init__()
         assert len(num_experts) == 2, 'only 2 levels of heirarchy for experts allowed for now'
+
+        self.dim = dim
 
         num_experts_outer, num_experts_inner = num_experts
         self.num_experts_outer = num_experts_outer
@@ -350,7 +377,7 @@ class HeirarchicalMoE(nn.Module):
         self.gate_inner = Top2Gating(dim, num_gates = num_experts_inner, outer_expert_dims = (num_experts_outer,), **gating_kwargs)
 
         num_experts_outer, num_experts_inner = num_experts
-        self.experts = nn.ModuleList([Experts(dim, num_experts = num_experts_inner, hidden_mult = expert_hidden_mult, dropout = expert_dropout) for _ in range(num_experts_outer)])
+        self.experts = nn.ModuleList([Experts(dim, num_experts = num_experts_inner, hidden_mult = expert_hidden_mult, dropout = dropout) for _ in range(num_experts_outer)])
 
         self.loss_coef = loss_coef
         self.router_z_loss_coef = router_z_loss_coef
@@ -388,4 +415,49 @@ class HeirarchicalMoE(nn.Module):
         expert_outputs_outer = einsum('e f b c d, e b n f c -> e b n d', expert_outputs, combine_tensor_inner)
         output = einsum('e b c d, b n e c -> b n d', expert_outputs_outer, combine_tensor_outer)
 
-        return output, (loss_outer + loss_inner) * self.loss_coef, (router_z_loss_outer + router_z_loss_inner) * self.router_z_loss_coef
+        balance_loss = (loss_outer + loss_inner) * self.loss_coef
+        router_z_loss = (router_z_loss_outer + router_z_loss_inner) * self.router_z_loss_coef
+
+        return output, balance_loss, router_z_loss
+
+# sparse moe block
+# in particular, they found that adding a feedforward before or after greatly stabilized the training and improved results
+
+class SparseMoEBlock(Module):
+    def __init__(
+        self,
+        moe: Union[MoE, HeirarchicalMoE],
+        *,
+        add_ff_before = False,
+        add_ff_after = True
+    ):
+        super().__init__()
+        dim = moe.dim
+
+        self.moe = moe
+        self.moe_prenorm = RMSNorm(dim)
+
+        self.ff_before = Expert(dim, prenorm = True) if add_ff_before else None
+        self.ff_after = Expert(dim, prenorm = True) if add_ff_after else None
+
+    def forward(self, x):
+
+        # feedforward before
+
+        if exists(self.ff_before):
+            x = self.ff_before(x) + x
+
+        # mixture of experts layer
+
+        residual = x
+
+        moe_out, balance_loss, router_z_loss = self.moe(self.moe_prenorm(x))
+
+        x = moe_out + residual
+
+        # feedforward after
+
+        if exists(self.ff_after):
+            x = self.ff_after(x) + x
+
+        return x, balance_loss, router_z_loss
