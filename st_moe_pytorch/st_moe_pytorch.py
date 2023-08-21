@@ -156,7 +156,7 @@ class TopNGating(Module):
         threshold_eval = 0.2,
         capacity_factor_train = 1.25,
         capacity_factor_eval = 2.,
-        detached_dispatch_tensor = True
+        straight_through_dispatch_tensor = True
     ):
         super().__init__()
         self.eps = eps
@@ -171,7 +171,7 @@ class TopNGating(Module):
         self.capacity_factor_train = capacity_factor_train
         self.capacity_factor_eval = capacity_factor_eval        
 
-        self.detached_dispatch_tensor = detached_dispatch_tensor
+        self.straight_through_dispatch_tensor = straight_through_dispatch_tensor
         self.register_buffer('zero', torch.zeros((1,)), persistent = False)
 
     def forward(self, x):
@@ -288,7 +288,7 @@ class TopNGating(Module):
 
         dispatch_tensor = combine_tensor.bool().type(dtype)
 
-        if not self.detached_dispatch_tensor:
+        if self.straight_through_dispatch_tensor:
             dispatch_tensor = dispatch_tensor + combine_tensor - combine_tensor.detach()
 
         # balance losses - (batch, experts)
@@ -328,7 +328,7 @@ class MoE(Module):
         loss_coef = 1e-2,
         router_z_loss_coef = 1e-3,
         experts: Optional[Module] = None,
-        detached_dispatch_tensor = True
+        straight_through_dispatch_tensor = True
     ):
         super().__init__()
         self.dim = dim
@@ -345,7 +345,7 @@ class MoE(Module):
             dim,
             top_n = gating_top_n,
             num_gates = num_experts,
-            detached_dispatch_tensor = detached_dispatch_tensor,
+            straight_through_dispatch_tensor = straight_through_dispatch_tensor,
             **gating_kwargs
         )
 
