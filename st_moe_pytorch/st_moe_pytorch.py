@@ -157,7 +157,6 @@ class Top2Gating(Module):
         dim,
         num_gates,
         eps = 1e-9,
-        outer_expert_dims: Tuple[int, ...] = tuple(),
         second_threshold_train = 0.2,
         second_threshold_eval = 0.2,
         capacity_factor_train = 1.25,
@@ -167,7 +166,7 @@ class Top2Gating(Module):
         super().__init__()
         self.eps = eps
         self.num_gates = num_gates
-        self.w_gating = nn.Parameter(torch.randn(*outer_expert_dims, dim, num_gates))
+        self.to_gates = nn.Linear(dim, num_gates, bias = False)
 
         self.second_threshold_train = second_threshold_train
         self.second_threshold_eval = second_threshold_eval
@@ -196,7 +195,7 @@ class Top2Gating(Module):
 
         # gate logits and gates
 
-        gate_logits = einsum('... b n d, ... d e -> ... b n e', x, self.w_gating)
+        gate_logits = self.to_gates(x)
         raw_gates = gate_logits.softmax(dim = -1)
 
         # FIND TOP 2 EXPERTS PER POSITON
