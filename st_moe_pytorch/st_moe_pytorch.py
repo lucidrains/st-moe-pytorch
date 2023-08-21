@@ -149,8 +149,6 @@ class Top2Gating(Module):
         num_gates,
         eps = 1e-9,
         outer_expert_dims: Tuple[int, ...] = tuple(),
-        second_policy_train = 'random',
-        second_policy_eval = 'random',
         second_threshold_train = 0.2,
         second_threshold_eval = 0.2,
         capacity_factor_train = 1.25,
@@ -162,8 +160,6 @@ class Top2Gating(Module):
         self.num_gates = num_gates
         self.w_gating = nn.Parameter(torch.randn(*outer_expert_dims, dim, num_gates))
 
-        self.second_policy_train = second_policy_train
-        self.second_policy_eval = second_policy_eval
         self.second_threshold_train = second_threshold_train
         self.second_threshold_eval = second_threshold_eval
         self.capacity_factor_train = capacity_factor_train
@@ -179,11 +175,10 @@ class Top2Gating(Module):
     ):
         *_, b, group_size, dim, dtype, num_gates = *x.shape, x.dtype, self.num_gates
 
-        # policy, threshold, capacity depending on training or eval
+        # threshold, capacity depending on training or eval
 
         suffix = 'train' if self.training else 'eval'
 
-        policy = getattr(self, f'second_policy_{suffix}')
         threshold = getattr(self, f'second_threshold_{suffix}')
         capacity_factor = getattr(self, f'capacity_factor_{suffix}')
 
@@ -243,20 +238,12 @@ class Top2Gating(Module):
         else:
             balance_loss = self.zero
 
-        # Depending on the policy in the hparams, we may drop out some of the
-        # second-place experts.
+        # Best performing policy was to route to the second expert, with probability of min(1., score / threshold), where score = gate2 / (gate1 + gate2)
+        # optimal threshold was ~ 0.2
 
-        if policy == "all":
-            pass
-        elif policy == "none":
-            mask_2 = torch.zeros_like(mask_2)
-        elif policy == "threshold":
-            mask_2 *= (gate_2 > threshold).float()
-        elif policy == "random":
-            probs = torch.zeros_like(gate_2).uniform_(0., 1.)
-            mask_2 *= (probs < (gate_2 / max(threshold, self.eps))).float().unsqueeze(-1)
-        else:
-            raise ValueError(f"Unknown policy {policy}")
+        probs = torch.zeros_like(gate_2).uniform_(0., 1.)
+        route_second_expert = probs < (gate_2 / max(threshold, self.eps))
+        mask_2 *= rearrange(route_second_expert.float(), '... -> ... 1')
 
         # Each sequence sends (at most?) expert_capacity positions to each expert.
         # Static expert_capacity dimension is needed for expert batch sizes
@@ -335,8 +322,6 @@ class MoE(Module):
         dim,
         num_experts = 16,
         expert_hidden_mult = 4,
-        second_policy_train = 'random',
-        second_policy_eval = 'random',
         second_threshold_train = 0.2,
         second_threshold_eval = 0.2,
         capacity_factor_train = 1.25,
@@ -351,8 +336,6 @@ class MoE(Module):
         self.num_experts = num_experts
 
         gating_kwargs = dict(
-            second_policy_train = second_policy_train,
-            second_policy_eval = second_policy_eval,
             second_threshold_train = second_threshold_train,
             second_threshold_eval = second_threshold_eval,
             capacity_factor_train = capacity_factor_train,
@@ -403,8 +386,6 @@ class HeirarchicalMoE(Module):
         dim,
         num_experts: Tuple[int, int] = (4, 4),
         expert_hidden_mult = 4,
-        second_policy_train = 'random',
-        second_policy_eval = 'random',
         second_threshold_train = 0.2,
         second_threshold_eval = 0.2,
         capacity_factor_train = 1.25,
@@ -424,8 +405,6 @@ class HeirarchicalMoE(Module):
         self.num_experts_inner = num_experts_inner
 
         gating_kwargs = dict(
-            second_policy_train = second_policy_train,
-            second_policy_eval = second_policy_eval,
             second_threshold_train = second_threshold_train,
             second_threshold_eval = second_threshold_eval,
             capacity_factor_train = capacity_factor_train,
