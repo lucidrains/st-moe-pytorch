@@ -22,8 +22,7 @@ $ pip install st-moe-pytorch
 
 ```python
 import torch
-from torch import nn
-from st_moe_pytorch.st_moe_pytorch import MoE
+from st_moe_pytorch import MoE
 
 moe = MoE(
     dim = 512,
@@ -39,6 +38,18 @@ moe = MoE(
 
 inputs = torch.randn(4, 1024, 512)
 out, balance_loss, router_z_loss = moe(inputs) # (4, 1024, 512), (1,), (1,)
+
+# for the entire mixture of experts block, in context of transformer
+
+from st_moe_pytorch import SparseMoEBlock
+
+moe_block = SparseMoEBlock(
+    moe,
+    add_ff_before = True,
+    add_ff_after = True
+)
+
+out, balance_loss, router_z_loss = moe_block(inputs) # (4, 1024, 512), (1,), (1,)
 ```
 
 ## Todo
