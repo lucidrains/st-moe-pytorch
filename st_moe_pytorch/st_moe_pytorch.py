@@ -187,15 +187,20 @@ class Top2Gating(Module):
         threshold = getattr(self, f'second_threshold_{suffix}')
         capacity_factor = getattr(self, f'capacity_factor_{suffix}')
 
-        # logits and gates
+        # Each sequence sends (at most?) expert_capacity positions to each expert.
+        # Static expert_capacity dimension is needed for expert batch sizes
+
+        expert_capacity = min(group_size, int((group_size * capacity_factor) / num_gates))
+        expert_capacity = max(expert_capacity, MIN_EXPERT_CAPACITY)
+        expert_capacity_f = float(expert_capacity)
+
+        # gate logits and gates
 
         gate_logits = einsum('... b n d, ... d e -> ... b n e', x, self.w_gating)
         raw_gates = gate_logits.softmax(dim = -1)
 
         # FIND TOP 2 EXPERTS PER POSITON
         # Find the top expert for each position. shape=[batch, group]
-
-        density_1_proxy = raw_gates
 
         topk_raw_gates_values, topk_raw_gates_indices = raw_gates.topk(k = 2, dim = -1)
 
@@ -211,32 +216,12 @@ class Top2Gating(Module):
         gate_1 = gate_1 / denom
         gate_2 = gate_2 / denom
 
-        # BALANCING LOSSES
-        # shape = [batch, experts]
-        # We want to equalize the fraction of the batch assigned to each expert
-
-        density_1 = reduce(mask_1, '... n e -> ... e', 'mean')
-        # Something continuous that is correlated with what we want to equalize.
-        density_1_proxy = reduce(density_1_proxy, '... n e -> ... e', 'mean')
-
-        if self.training:
-            balance_loss = (density_1_proxy * density_1).mean() * float(num_gates ** 2)
-        else:
-            balance_loss = self.zero
-
         # Best performing policy was to route to the second expert, with probability of min(1., score / threshold), where score = gate2 / (gate1 + gate2)
         # optimal threshold was ~ 0.2
 
         probs = torch.zeros_like(gate_2).uniform_(0., 1.)
         route_second_expert = probs < (gate_2 / max(threshold, self.eps))
         mask_2 *= rearrange(route_second_expert.float(), '... -> ... 1')
-
-        # Each sequence sends (at most?) expert_capacity positions to each expert.
-        # Static expert_capacity dimension is needed for expert batch sizes
-
-        expert_capacity = min(group_size, int((group_size * capacity_factor) / num_gates))
-        expert_capacity = max(expert_capacity, MIN_EXPERT_CAPACITY)
-        expert_capacity_f = float(expert_capacity)
 
         # COMPUTE ASSIGNMENT TO EXPERTS
         # [batch, group, experts]
@@ -284,6 +269,17 @@ class Top2Gating(Module):
 
         if not self.detached_dispatch_tensor:
             dispatch_tensor = dispatch_tensor + combine_tensor - combine_tensor.detach()
+
+        # balance losses - (batch, experts)
+        # We want to equalize the fraction of the batch assigned to each expert
+
+        if self.training:
+            density_1 = reduce(mask_1, '... n e -> ... e', 'mean')
+            density_1_proxy = reduce(raw_gates, '... n e -> ... e', 'mean') # Something continuous that is correlated with what we want to equalize.
+
+            balance_loss = (density_1_proxy * density_1).mean() * float(num_gates ** 2)
+        else:
+            balance_loss = self.zero
 
         # calculate the router z-loss proposed in paper
 
