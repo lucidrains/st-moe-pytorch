@@ -1,6 +1,7 @@
 import math
 from functools import partial
 from inspect import isfunction
+from collections import namedtuple
 from typing import Tuple, Union, Optional
 
 import torch
@@ -15,6 +16,12 @@ from colt5_attention import topk as differentiable_topk
 # constants
 
 MIN_EXPERT_CAPACITY = 4
+
+MixtureOfExpertsReturn = namedtuple('MixtureOfExpertsReturn', [
+    'outputs',
+    'balance_loss',
+    'router_z_loss'
+])
 
 # helper functions
 
@@ -376,7 +383,7 @@ class MoE(Module):
         balance_loss = loss * self.loss_coef
         router_z_loss = router_z_loss * self.router_z_loss_coef
 
-        return output, balance_loss, router_z_loss
+        return MixtureOfExpertsReturn(output, balance_loss, router_z_loss)
 
 # 2-level heirarchical mixture of experts
 
@@ -468,7 +475,7 @@ class HeirarchicalMoE(Module):
         balance_loss = (loss_outer + loss_inner) * self.loss_coef
         router_z_loss = (router_z_loss_outer + router_z_loss_inner) * self.router_z_loss_coef
 
-        return output, balance_loss, router_z_loss
+        return MixtureOfExpertsReturn(output, balance_loss, router_z_loss)
 
 # sparse moe block
 # in particular, they found that adding a feedforward before or after greatly stabilized the training and improved results
@@ -510,4 +517,4 @@ class SparseMoEBlock(Module):
         if exists(self.ff_after):
             x = self.ff_after(x) + x
 
-        return x, balance_loss, router_z_loss
+        return MixtureOfExpertsReturn(x, balance_loss, router_z_loss)

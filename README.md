@@ -33,7 +33,7 @@ moe = MoE(
 )
 
 inputs = torch.randn(4, 1024, 512)
-out, aux_loss, router_z_loss = moe(inputs) # (4, 1024, 512), (1,), (1,)
+out, balance_loss, router_z_loss = moe(inputs) # (4, 1024, 512), (1,), (1,)
 ```
 
 Hierarchical Mixture of Experts
@@ -48,7 +48,7 @@ moe = HeirarchicalMoE(
 )
 
 inputs = torch.randn(4, 1024, 512)
-out, aux_loss, router_z_loss = moe(inputs) # (4, 1024, 512), (1,), (1,)
+out, balance_loss, router_z_loss = moe(inputs) # (4, 1024, 512), (1,), (1,)
 ```
 
 ## Todo
