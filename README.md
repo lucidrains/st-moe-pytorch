@@ -51,6 +51,7 @@ out, balance_loss, router_z_loss = moe(inputs) # (4, 1024, 512), (1,), (1,)
 - [x] consult some MoE experts in the open source community; question why hierarchical MoE is needed, in light of results from soft-MoE
 - [x] offer top-n gating generalization, as it seems top3 (with smaller threshold) can work even better
 
+- [ ] figure out if there was an error in <a href="https://github.com/lucidrains/mixture-of-experts/blob/master/mixture_of_experts/mixture_of_experts.py#L210">a previous transcription</a> (seems like weighting is done twice?)
 - [ ] allow for different thresholds for second vs third routed expert
 - [ ] improvise a `Top2GatingWithCoordinateDescent` for `MoE` without `importance`
 - [ ] take care of scatter gather, and once done, port over to <a href="https://github.com/lucidrains/soft-moe-pytorch">soft moe</a>
