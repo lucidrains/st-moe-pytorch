@@ -1,6 +1,6 @@
 from functools import partial
 from collections import namedtuple
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 import torch
 from torch.nn import Module, ModuleList
@@ -34,8 +34,8 @@ def default(val, default):
 
     return default() if callable(default) else default
 
-def cast_tuple(el):
-    return el if isinstance(el, tuple) else (el,)
+def cast_tuple(el, len = 1):
+    return el if isinstance(el, tuple) else ((el,) * len)
 
 def pack_one(t, pattern):
     return pack([t], pattern)
@@ -144,14 +144,16 @@ class Experts(Module):
 # gating network
 
 class TopNGating(Module):
+
+    @beartype
     def __init__(
         self,
         dim,
         num_gates,
         eps = 1e-9,
         top_n = 2,
-        threshold_train = 0.2,
-        threshold_eval = 0.2,
+        threshold_train: Union[float, Tuple[float, ...]] = 0.2,
+        threshold_eval: Union[float, Tuple[float, ...]] = 0.2,
         capacity_factor_train = 1.25,
         capacity_factor_eval = 2.,
         straight_through_dispatch_tensor = True
@@ -163,9 +165,16 @@ class TopNGating(Module):
 
         assert top_n >= 2, 'must be 2 or more experts'
         self.top_n = top_n
+        top_n_minus_1 = top_n - 1
 
-        self.threshold_train = threshold_train
-        self.threshold_eval = threshold_eval
+        threshold_train = cast_tuple(threshold_train, top_n_minus_1)
+        threshold_eval = cast_tuple(threshold_eval, top_n_minus_1)
+
+        assert len(threshold_train) == len(threshold_eval) == top_n_minus_1
+
+        self.register_buffer('threshold_train', torch.tensor([eps, *threshold_train]))
+        self.register_buffer('threshold_eval', torch.tensor([eps, *threshold_eval]))
+
         self.capacity_factor_train = capacity_factor_train
         self.capacity_factor_eval = capacity_factor_eval        
 
@@ -182,7 +191,7 @@ class TopNGating(Module):
         k - top-n experts
         """
 
-        *_, b, group_size, dim, dtype, num_gates, eps = *x.shape, x.dtype, self.num_gates, self.eps
+        *_, b, group_size, dim, dtype, top_n, num_gates, eps = *x.shape, x.dtype, self.top_n, self.num_gates, self.eps
 
         # threshold, capacity depending on training or eval
 
@@ -205,7 +214,7 @@ class TopNGating(Module):
 
         # find top N experts per position
 
-        gates, gate_indices = raw_gates.topk(k = 2, dim = -1)
+        gates, gate_indices = raw_gates.topk(k = top_n, dim = -1)
 
         # move the top-n dimension to be first
 
@@ -230,9 +239,11 @@ class TopNGating(Module):
 
         probs = torch.zeros_like(gates).uniform_(0., 1.)
 
-        should_route = probs < (gates / max(threshold, eps))
+        threshold = rearrange(threshold, 'k -> k 1 1')
+        should_route = probs < (gates / threshold.clamp(min = eps))
 
         # tokens should always be routed to first expert
+        # threshold for first expert already set to very small number, but just in case
 
         should_route[0, ...] = True
 
@@ -317,6 +328,8 @@ class TopNGating(Module):
 # plain mixture of experts
 
 class MoE(Module):
+
+    @beartype
     def __init__(self,
         dim,
         num_experts = 16,
@@ -355,12 +368,12 @@ class MoE(Module):
         self.loss_coef = loss_coef
         self.router_z_loss_coef = router_z_loss_coef
 
-    def forward(self, inputs, **kwargs):
-        dispatch_tensor, combine_tensor, loss, router_z_loss = self.gate(inputs)
+    def forward(self, x):
+        dispatch_tensor, combine_tensor, loss, router_z_loss = self.gate(x)
 
         # dispatch
 
-        expert_inputs = einsum('b n d, b n e c -> e b c d', inputs, dispatch_tensor)
+        expert_inputs = einsum('b n d, b n e c -> e b c d', x, dispatch_tensor)
 
         # feed the expert inputs through the experts.
 
