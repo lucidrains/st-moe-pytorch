@@ -266,6 +266,7 @@ class TopNGating(Module):
         mask_flat = reduce(mask, '... n e -> ... n', 'sum')
 
         # (k, batch, sequence) - weighted assignment
+        # following https://github.com/tensorflow/mesh/blob/master/mesh_tensorflow/transformer/moe.py#L1903
         gates = gates * mask_flat
 
         # (batch, sequence, experts, expert_capacity)
@@ -273,11 +274,13 @@ class TopNGating(Module):
         N = None
 
         gates = gates[..., N, N]
+        mask_flat = mask_flat[..., N, N]
         one_hot_gate_indices = one_hot_gate_indices[..., N]
         safe_one_hot_gates = safe_one_hot(positions.long(), expert_capacity)[..., N, :]
 
         combine_tensor = reduce(
             gates
+            * mask_flat
             * one_hot_gate_indices
             * safe_one_hot_gates
         , 'k ... -> ...', 'sum')

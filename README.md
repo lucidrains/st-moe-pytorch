@@ -61,7 +61,7 @@ out, balance_loss, router_z_loss = moe_block(inputs) # (4, 1024, 512), (1,), (1,
 - [x] redo all the transcribed code from google with einops, as it is not very clear
 - [x] consult some MoE experts in the open source community; question why hierarchical MoE is needed, in light of results from soft-MoE
 - [x] offer top-n gating generalization, as it seems top3 (with smaller threshold) can work even better
-- [x] figure out if there was an error in <a href="https://github.com/lucidrains/mixture-of-experts/blob/master/mixture_of_experts/mixture_of_experts.py#L210">a previous transcription</a> - yea there was an error
+- [x] figure out if there was an error in <a href="https://github.com/lucidrains/mixture-of-experts/blob/master/mixture_of_experts/mixture_of_experts.py#L210">a previous transcription</a> - no there was not an error
 
 - [ ] allow for different thresholds for second vs third routed expert
 - [ ] improvise a `Top2GatingWithCoordinateDescent` for `MoE` without `importance`
