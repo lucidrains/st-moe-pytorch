@@ -50,12 +50,6 @@ def Sequential(*modules):
 
 # tensor related helper functions
 
-def top1(t):
-    topk_return = t.topk(k = 1)
-    values = rearrange(topk_return.values, '... 1 -> ...')
-    indices = rearrange(topk_return.indices, '... 1 -> ...')
-    return values, indices
-
 def cumsum_exclusive(t, dim = -2):
     num_dims = len(t.shape)
     num_pad_dims = - dim - 1
