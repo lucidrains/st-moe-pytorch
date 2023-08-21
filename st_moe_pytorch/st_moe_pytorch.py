@@ -50,9 +50,9 @@ def Sequential(*modules):
 
 # tensor related helper functions
 
-def cumsum_exclusive(t, dim = -2):
-    num_dims = len(t.shape)
-    num_pad_dims = - dim - 1
+def cumsum_exclusive(t, dim = -3):
+    assert dim < 0
+    num_pad_dims = -dim - 1
     pre_padding = (0, 0) * num_pad_dims
     return F.pad(t, (*pre_padding, 1, -1)).cumsum(dim = dim)
 
@@ -145,14 +145,15 @@ class Experts(Module):
 
 # gating network
 
-class Top2Gating(Module):
+class TopNGating(Module):
     def __init__(
         self,
         dim,
         num_gates,
         eps = 1e-9,
-        second_threshold_train = 0.2,
-        second_threshold_eval = 0.2,
+        top_n = 2,
+        threshold_train = 0.2,
+        threshold_eval = 0.2,
         capacity_factor_train = 1.25,
         capacity_factor_eval = 2.,
         detached_dispatch_tensor = True
@@ -162,8 +163,11 @@ class Top2Gating(Module):
         self.num_gates = num_gates
         self.to_gates = nn.Linear(dim, num_gates, bias = False)
 
-        self.second_threshold_train = second_threshold_train
-        self.second_threshold_eval = second_threshold_eval
+        assert top_n >= 2, 'must be 2 or more experts'
+        self.top_n = top_n
+
+        self.threshold_train = threshold_train
+        self.threshold_eval = threshold_eval
         self.capacity_factor_train = capacity_factor_train
         self.capacity_factor_eval = capacity_factor_eval        
 
@@ -171,13 +175,22 @@ class Top2Gating(Module):
         self.register_buffer('zero', torch.zeros((1,)), persistent = False)
 
     def forward(self, x):
-        *_, b, group_size, dim, dtype, num_gates = *x.shape, x.dtype, self.num_gates
+        """
+        einstein notation:
+
+        b - batch
+        n - sequence
+        e - experts
+        k - topk experts
+        """
+
+        *_, b, group_size, dim, dtype, num_gates, eps = *x.shape, x.dtype, self.num_gates, self.eps
 
         # threshold, capacity depending on training or eval
 
         suffix = 'train' if self.training else 'eval'
 
-        threshold = getattr(self, f'second_threshold_{suffix}')
+        threshold = getattr(self, f'threshold_{suffix}')
         capacity_factor = getattr(self, f'capacity_factor_{suffix}')
 
         # Each sequence sends (at most?) expert_capacity positions to each expert.
@@ -192,74 +205,84 @@ class Top2Gating(Module):
         gate_logits = self.to_gates(x)
         raw_gates = gate_logits.softmax(dim = -1)
 
-        # FIND TOP 2 EXPERTS PER POSITON
-        # Find the top expert for each position. shape=[batch, group]
+        # find top N experts per position
 
         gates, gate_indices = raw_gates.topk(k = 2, dim = -1)
+
+        # move the topk dimension to be first
+
+        gates = rearrange(gates, '... k -> k ...')
+        gate_indices = rearrange(gate_indices, '... k -> k ...')
 
         # masks
 
         one_hot_gate_indices = F.one_hot(gate_indices, num_gates)
+        mask = one_hot_gate_indices.float()
 
-        one_hot_index_1, one_hot_index_2 = one_hot_gate_indices.unbind(dim = -2)
-
-        mask_1, mask_2 = one_hot_gate_indices.float().unbind(dim = -2)
-
-        index_1, index_2 = gate_indices.unbind(dim = -1)
+        mask_1 = mask[0] # needed for balancing loss
 
         # normalize top2 gate scores
 
-        denom = reduce(gates, '... e -> ... 1', 'sum').clamp(min = self.eps)
+        denom = reduce(gates, 'k ... -> 1 ...', 'sum').clamp(min = eps)
         gates = gates / denom
 
-        gate_1, gate_2 = gates.unbind(dim = -1)
-
-        # Best performing policy was to route to the second expert, with probability of min(1., score / threshold), where score = gate2 / (gate1 + gate2)
+        # best performing policy was to route to the second expert, with probability of min(1., score / threshold), where score = gate2 / (gate1 + gate2)
         # optimal threshold was ~ 0.2
+        # generalized to more than 2 experts
 
-        probs = torch.zeros_like(gate_2).uniform_(0., 1.)
-        route_second_expert = probs < (gate_2 / max(threshold, self.eps))
-        mask_2 *= rearrange(route_second_expert.float(), '... -> ... 1')
+        probs = torch.zeros_like(gates).uniform_(0., 1.)
 
-        # COMPUTE ASSIGNMENT TO EXPERTS
-        # [batch, group, experts]
+        should_route = probs < (gates / max(threshold, eps))
+
+        # tokens should always be routed to first expert
+
+        should_route[0, ...] = True
+
+        mask *= rearrange(should_route.float(), '... -> ... 1')
+
+        mask_cumsum = cumsum_exclusive(mask, dim = -2) # along sequence dimension
+
+        # compute assignment to experts - (batch, seq, experts)
+
         # This is the position within the expert's mini-batch for this sequence
 
-        position_in_expert_1 = cumsum_exclusive(mask_1) * mask_1
-        # Remove the elements that don't fit. [batch, group, experts]
-        mask_1 *= (position_in_expert_1 < expert_capacity_f).float()
-        # [batch, experts]
-        # How many examples in this sequence go to this expert
-        mask_1_count = reduce(mask_1, '... n e -> ... 1 e', 'sum')
-        # [batch, group] - mostly ones, but zeros where something didn't fit
-        mask_1_flat = reduce(mask_1, '... n e -> ... n', 'sum')
-        # [batch, group]
-        position_in_expert_1 = reduce(position_in_expert_1, '... n e -> ... n', 'sum')
-        # Weight assigned to first expert.  [batch, group]
-        gate_1 = gate_1 * mask_1_flat
+        positions = []
+        prev_expert_count = 0.
 
-        position_in_expert_2 = cumsum_exclusive(mask_2) + mask_1_count
-        position_in_expert_2 *= mask_2
-        mask_2 *= (position_in_expert_2 < expert_capacity_f).float()
-        mask_2_flat = reduce(mask_2, '... n e -> ... n', 'sum')
+        for n in range(self.top_n):
+            position_in_expert = (mask_cumsum[n] + prev_expert_count) * mask[n]
 
-        position_in_expert_2 = reduce(position_in_expert_2, '... n e -> ... n', 'sum')
-        gate_2 = gate_2 * mask_2_flat
-        
-        # [batch, group, experts, expert_capacity]
+            # Remove the elements that don't fit. (batch, sequence, experts)
+            mask[n] *= (position_in_expert < expert_capacity_f).float()
+
+            # How many examples in this sequence go to this expert - needed for the next iteration as offset
+            prev_expert_count = reduce(mask[n], '... n e -> ... 1 e', 'sum')
+
+            # (batch, sequence)
+            position_in_expert = reduce(position_in_expert, '... n e -> ... n', 'sum')
+            positions.append(position_in_expert)
+
+        positions = torch.stack(positions)
+
+        # (k, batch, sequence) - mostly ones, but zeros where something didn't fit
+        mask_flat = reduce(mask, '... n e -> ... n', 'sum')
+
+        # (k, batch, sequence) - weighted assignment
+        gates = gates * mask_flat
+
+        # (batch, sequence, experts, expert_capacity)
 
         N = None
 
-        combine_tensor = (
-            gate_1[..., N, N]
-            * mask_1_flat[..., N, N]
-            * one_hot_index_1[..., N]
-            * safe_one_hot(position_in_expert_1.long(), expert_capacity)[..., N, :] +
-            gate_2[..., N, N]
-            * mask_2_flat[..., N, N]
-            * one_hot_index_2[..., N]
-            * safe_one_hot(position_in_expert_2.long(), expert_capacity)[..., N, :]
-        )
+        gates = gates[..., N, N]
+        one_hot_gate_indices = one_hot_gate_indices[..., N]
+        safe_one_hot_gates = safe_one_hot(positions.long(), expert_capacity)[..., N, :]
+
+        combine_tensor = reduce(
+            gates
+            * one_hot_gate_indices
+            * safe_one_hot_gates
+        , 'k ... -> ...', 'sum')
 
         # dispatch tensor
 
@@ -297,10 +320,11 @@ class MoE(Module):
         dim,
         num_experts = 16,
         expert_hidden_mult = 4,
-        second_threshold_train = 0.2,
-        second_threshold_eval = 0.2,
+        threshold_train = 0.2,
+        threshold_eval = 0.2,
         capacity_factor_train = 1.25,
         capacity_factor_eval = 2.,
+        gating_top_n = 2,
         loss_coef = 1e-2,
         router_z_loss_coef = 1e-3,
         experts: Optional[Module] = None,
@@ -311,14 +335,15 @@ class MoE(Module):
         self.num_experts = num_experts
 
         gating_kwargs = dict(
-            second_threshold_train = second_threshold_train,
-            second_threshold_eval = second_threshold_eval,
+            threshold_train = threshold_train,
+            threshold_eval = threshold_eval,
             capacity_factor_train = capacity_factor_train,
             capacity_factor_eval = capacity_factor_eval
         )
 
-        self.gate = Top2Gating(
+        self.gate = TopNGating(
             dim,
+            top_n = gating_top_n,
             num_gates = num_experts,
             detached_dispatch_tensor = detached_dispatch_tensor,
             **gating_kwargs
