@@ -195,19 +195,24 @@ class Top2Gating(Module):
         # FIND TOP 2 EXPERTS PER POSITON
         # Find the top expert for each position. shape=[batch, group]
 
-        topk_raw_gates_values, topk_raw_gates_indices = raw_gates.topk(k = 2, dim = -1)
+        gates, gate_indices = raw_gates.topk(k = 2, dim = -1)
 
-        gate_1, gate_2 = topk_raw_gates_values.unbind(dim = -1)
-        index_1, index_2 = topk_raw_gates_indices.unbind(dim = -1)
+        # masks
 
-        mask_1 = F.one_hot(index_1, num_gates).float()
-        mask_2 = F.one_hot(index_2, num_gates).float()
+        one_hot_gate_indices = F.one_hot(gate_indices, num_gates)
+
+        one_hot_index_1, one_hot_index_2 = one_hot_gate_indices.unbind(dim = -2)
+
+        mask_1, mask_2 = one_hot_gate_indices.float().unbind(dim = -2)
+
+        index_1, index_2 = gate_indices.unbind(dim = -1)
 
         # normalize top2 gate scores
 
-        denom = gate_1 + gate_2 + self.eps
-        gate_1 = gate_1 / denom
-        gate_2 = gate_2 / denom
+        denom = reduce(gates, '... e -> ... 1', 'sum').clamp(min = self.eps)
+        gates = gates / denom
+
+        gate_1, gate_2 = gates.unbind(dim = -1)
 
         # Best performing policy was to route to the second expert, with probability of min(1., score / threshold), where score = gate2 / (gate1 + gate2)
         # optimal threshold was ~ 0.2
@@ -231,7 +236,7 @@ class Top2Gating(Module):
         # [batch, group]
         position_in_expert_1 = reduce(position_in_expert_1, '... n e -> ... n', 'sum')
         # Weight assigned to first expert.  [batch, group]
-        gate_1 *= mask_1_flat
+        gate_1 = gate_1 * mask_1_flat
 
         position_in_expert_2 = cumsum_exclusive(mask_2) + mask_1_count
         position_in_expert_2 *= mask_2
@@ -239,7 +244,7 @@ class Top2Gating(Module):
         mask_2_flat = reduce(mask_2, '... n e -> ... n', 'sum')
 
         position_in_expert_2 = reduce(position_in_expert_2, '... n e -> ... n', 'sum')
-        gate_2 *= mask_2_flat
+        gate_2 = gate_2 * mask_2_flat
         
         # [batch, group, experts, expert_capacity]
 
@@ -248,11 +253,11 @@ class Top2Gating(Module):
         combine_tensor = (
             gate_1[..., N, N]
             * mask_1_flat[..., N, N]
-            * F.one_hot(index_1, num_gates)[..., N]
+            * one_hot_index_1[..., N]
             * safe_one_hot(position_in_expert_1.long(), expert_capacity)[..., N, :] +
             gate_2[..., N, N]
             * mask_2_flat[..., N, N]
-            * F.one_hot(index_2, num_gates)[..., N]
+            * one_hot_index_2[..., N]
             * safe_one_hot(position_in_expert_2.long(), expert_capacity)[..., N, :]
         )
 
