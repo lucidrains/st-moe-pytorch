@@ -181,7 +181,7 @@ class TopNGating(Module):
         b - batch
         n - sequence
         e - experts
-        k - topk experts
+        k - top-n experts
         """
 
         *_, b, group_size, dim, dtype, num_gates, eps = *x.shape, x.dtype, self.num_gates, self.eps
@@ -209,7 +209,7 @@ class TopNGating(Module):
 
         gates, gate_indices = raw_gates.topk(k = 2, dim = -1)
 
-        # move the topk dimension to be first
+        # move the top-n dimension to be first
 
         gates = rearrange(gates, '... k -> k ...')
         gate_indices = rearrange(gate_indices, '... k -> k ...')
@@ -221,7 +221,7 @@ class TopNGating(Module):
 
         mask_1 = mask[0] # needed for balancing loss
 
-        # normalize top2 gate scores
+        # normalize top-n gate scores
 
         denom = reduce(gates, 'k ... -> 1 ...', 'sum').clamp(min = eps)
         gates = gates / denom
