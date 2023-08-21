@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 setup(
   name = 'st-moe-pytorch',
   packages = find_packages(exclude=[]),
-  version = '0.0.14',
+  version = '0.0.15',
   license='MIT',
   description = 'ST - Mixture of Experts - Pytorch',
   author = 'Phil Wang',
@@ -16,6 +16,7 @@ setup(
     'mixture of experts'
   ],
   install_requires=[
+    'beartype',
     'CoLT5-attention>=0.10.15',
     'einops>=0.6',
     'torch>=2.0',

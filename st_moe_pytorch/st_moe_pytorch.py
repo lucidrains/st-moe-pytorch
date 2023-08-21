@@ -9,6 +9,8 @@ from torch.nn import Module, ModuleList
 from torch import nn, einsum
 import torch.nn.functional as F
 
+from beartype import beartype
+
 from einops import rearrange, repeat, reduce, pack, unpack
 
 from colt5_attention import topk as differentiable_topk
@@ -175,11 +177,7 @@ class Top2Gating(Module):
         self.detached_dispatch_tensor = detached_dispatch_tensor
         self.register_buffer('zero', torch.zeros((1,)), persistent = False)
 
-    def forward(
-        self,
-        x,
-        importance = None
-    ):
+    def forward(self, x):
         *_, b, group_size, dim, dtype, num_gates = *x.shape, x.dtype, self.num_gates
 
         # threshold, capacity depending on training or eval
@@ -199,32 +197,13 @@ class Top2Gating(Module):
 
         density_1_proxy = raw_gates
 
-        if exists(importance):
-            gate_1, index_1 = top1(raw_gates)
-            mask_1 = F.one_hot(index_1, num_gates).float()
+        topk_raw_gates_values, topk_raw_gates_indices = raw_gates.topk(k = 2, dim = -1)
 
-            equals_one_mask = (importance == 1.).float()
-            mask_1 *= equals_one_mask[..., None]
-            gate_1 *= equals_one_mask
-            density_1_proxy = density_1_proxy * equals_one_mask[..., None]
+        gate_1, gate_2 = topk_raw_gates_values.unbind(dim = -1)
+        index_1, index_2 = topk_raw_gates_indices.unbind(dim = -1)
 
-            gates_without_top_1 = raw_gates * (1. - mask_1)
-
-            gate_2, index_2 = top1(gates_without_top_1)
-            mask_2 = F.one_hot(index_2, num_gates).float()
-
-            greater_zero_mask = (importance > 0.).float()
-            mask_2 *= greater_zero_mask[..., None]
-            del greater_zero_mask
-
-        else:
-            topk_raw_gates_values, topk_raw_gates_indices = raw_gates.topk(k = 2, dim = -1)
-
-            gate_1, gate_2 = topk_raw_gates_values.unbind(dim = -1)
-            index_1, index_2 = topk_raw_gates_indices.unbind(dim = -1)
-
-            mask_1 = F.one_hot(index_1, num_gates).float()
-            mask_2 = F.one_hot(index_2, num_gates).float()
+        mask_1 = F.one_hot(index_1, num_gates).float()
+        mask_2 = F.one_hot(index_2, num_gates).float()
 
         # normalize top2 gate scores
 
@@ -310,13 +289,8 @@ class Top2Gating(Module):
 
         if self.training:
             router_z_loss = torch.logsumexp(gate_logits, dim = -1)
-            router_z_loss = torch.square(router_z_loss)
-
-            if exists(importance):
-                router_z_loss = router_z_loss * equals_one_mask
-                router_z_loss = router_z_loss.sum() / equals_one_mask.sum().clamp(min = 1e-5)
-            else:
-                router_z_loss = router_z_loss.mean()
+            router_z_loss = torch.square(router_z_loss)            
+            router_z_loss = router_z_loss.mean()
         else:
             router_z_loss = self.zero
 
@@ -385,105 +359,15 @@ class MoE(Module):
 
         return MixtureOfExpertsReturn(output, balance_loss, router_z_loss)
 
-# 2-level heirarchical mixture of experts
-
-class HeirarchicalMoE(Module):
-    def __init__(
-        self,
-        dim,
-        num_experts: Tuple[int, int] = (4, 4),
-        expert_hidden_mult = 4,
-        second_threshold_train = 0.2,
-        second_threshold_eval = 0.2,
-        capacity_factor_train = 1.25,
-        capacity_factor_eval = 2.,
-        loss_coef = 1e-2,
-        router_z_loss_coef = 1e-3,
-        detached_dispatch_tensor = True,
-        experts: Optional[Module] = None
-    ):
-        super().__init__()
-        assert len(num_experts) == 2, 'only 2 levels of heirarchy for experts allowed for now'
-
-        self.dim = dim
-
-        num_experts_outer, num_experts_inner = num_experts
-        self.num_experts_outer = num_experts_outer
-        self.num_experts_inner = num_experts_inner
-
-        gating_kwargs = dict(
-            second_threshold_train = second_threshold_train,
-            second_threshold_eval = second_threshold_eval,
-            capacity_factor_train = capacity_factor_train,
-            capacity_factor_eval = capacity_factor_eval
-        )
-
-        self.gate_outer = Top2Gating(
-            dim,
-            num_gates = num_experts_outer,
-            detached_dispatch_tensor = detached_dispatch_tensor,
-            **gating_kwargs
-        )
-
-        self.gate_inner = Top2Gating(
-            dim,
-            num_gates = num_experts_inner,
-            detached_dispatch_tensor = detached_dispatch_tensor,
-            outer_expert_dims = (num_experts_outer,),
-            **gating_kwargs
-        )
-
-        num_experts_outer, num_experts_inner = num_experts
-        self.experts = ModuleList([Experts(dim, num_experts = num_experts_inner, hidden_mult = expert_hidden_mult) for _ in range(num_experts_outer)])
-
-        self.loss_coef = loss_coef
-        self.router_z_loss_coef = router_z_loss_coef
-
-    def forward(self, inputs, **kwargs):
-        dispatch_tensor_outer, combine_tensor_outer, loss_outer, router_z_loss_outer = self.gate_outer(inputs)
-        expert_inputs_outer = einsum('b n d, b n e c -> e b c d', inputs, dispatch_tensor_outer)
-
-        # we construct an "importance" Tensor for the inputs to the second-level
-        # gating.  The importance of an input is 1.0 if it represents the
-        # first-choice expert-group and 0.5 if it represents the second-choice expert
-        # group.  This is used by the second-level gating.
-
-        importance = reduce(combine_tensor_outer, 'b n e c -> e b c', 'sum')
-        importance = 0.5 * ((importance > 0.5).float() + (importance > 0.).float())
-
-        dispatch_tensor_inner, combine_tensor_inner, loss_inner, router_z_loss_inner = self.gate_inner(expert_inputs_outer, importance = importance)
-        expert_inputs = einsum('e b n d, e b n f c -> e f b c d', expert_inputs_outer, dispatch_tensor_inner)
-
-        # Now feed the expert inputs through the experts.
-
-        expert_inputs, ps = pack_one(expert_inputs, 'o i * d')
-
-        expert_outputs = []
-
-        for inputs, hierarchy_experts in zip(expert_inputs, self.experts):
-            expert_outputs.append(hierarchy_experts(inputs))
-
-        expert_outputs = torch.stack(expert_outputs)
-        expert_outputs = unpack_one(expert_outputs, ps, 'o i * d')
-
-        # NOW COMBINE EXPERT OUTPUTS (reversing everything we have done)
-        # expert_output has shape [y0, x1, h, d, n]
-
-        expert_outputs_outer = einsum('e f b c d, e b n f c -> e b n d', expert_outputs, combine_tensor_inner)
-        output = einsum('e b c d, b n e c -> b n d', expert_outputs_outer, combine_tensor_outer)
-
-        balance_loss = (loss_outer + loss_inner) * self.loss_coef
-        router_z_loss = (router_z_loss_outer + router_z_loss_inner) * self.router_z_loss_coef
-
-        return MixtureOfExpertsReturn(output, balance_loss, router_z_loss)
-
 # sparse moe block
 # in particular, they found that adding a feedforward before or after greatly stabilized the training and improved results
 
 class SparseMoEBlock(Module):
+
+    @beartype
     def __init__(
         self,
-        moe: Union[MoE, HeirarchicalMoE],
+        moe: MoE,
         *,
         add_ff_before = False,
         add_ff_after = True

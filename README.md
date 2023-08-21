@@ -14,6 +14,8 @@ $ pip install st-moe-pytorch
 
 - <a href="https://stability.ai/">StabilityAI</a> for the generous sponsorship, as well as my other sponsors, for affording me the independence to open source artificial intelligence.
 
+- <a href="https://github.com/arankomat">Aran Komatsuzaki</a> for consultation on mixture-of-experts, for removal of 2-level MoE and simplifications to code
+
 ## Usage
 
 ```python
@@ -36,21 +38,6 @@ inputs = torch.randn(4, 1024, 512)
 out, balance_loss, router_z_loss = moe(inputs) # (4, 1024, 512), (1,), (1,)
 ```
 
-Hierarchical Mixture of Experts
-
-```python
-import torch
-from st_moe_pytorch import HeirarchicalMoE
-
-moe = HeirarchicalMoE(
-    dim = 512,
-    num_experts = (4, 4),       # 4 gates on the first layer, then 4 experts on the second, equaling 16 experts
-)
-
-inputs = torch.randn(4, 1024, 512)
-out, balance_loss, router_z_loss = moe(inputs) # (4, 1024, 512), (1,), (1,)
-```
-
 ## Todo
 
 - [x] add the router z-loss proposed in paper
@@ -58,8 +45,8 @@ out, balance_loss, router_z_loss = moe(inputs) # (4, 1024, 512), (1,), (1,)
 - [x] add an entire sparse moe block, complete with rmsnorm + residual as well as the ability to specify a feedforward before or after for stability
 - [x] double check equation for router z-loss for experts inner in hierarchical moe
 - [x] redo all the transcribed code from google with einops, as it is not very clear
+- [x] consult some MoE experts in the open source community; question why hierarchical MoE is needed, in light of results from soft-MoE
 
-- [ ] consult some MoE experts in the open source community; question why hierarchical MoE is needed, in light of results from soft-MoE
 - [ ] improvise a `Top2GatingWithCoordinateDescent` for `MoE` without `importance`
 - [ ] take care of scatter gather, and once done, port over to <a href="https://github.com/lucidrains/soft-moe-pytorch">soft moe</a>
 
