@@ -1,8 +1,6 @@
-import math
 from functools import partial
-from inspect import isfunction
 from collections import namedtuple
-from typing import Tuple, Union, Optional
+from typing import Optional
 
 import torch
 from torch.nn import Module, ModuleList
