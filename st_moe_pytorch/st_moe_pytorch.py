@@ -247,7 +247,7 @@ class Top2Gating(Module):
         mask_1 *= (position_in_expert_1 < expert_capacity_f).float()
         # [batch, experts]
         # How many examples in this sequence go to this expert
-        mask_1_count = reduce(mask_1, '... n e -> ... 1 e', 'mean')
+        mask_1_count = reduce(mask_1, '... n e -> ... 1 e', 'sum')
         # [batch, group] - mostly ones, but zeros where something didn't fit
         mask_1_flat = reduce(mask_1, '... n e -> ... n', 'sum')
         # [batch, group]
