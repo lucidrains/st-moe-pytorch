@@ -64,8 +64,15 @@ out, balance_loss, router_z_loss = moe_block(inputs) # (4, 1024, 512), (1,), (1,
 - [x] figure out if there was an error in <a href="https://github.com/lucidrains/mixture-of-experts/blob/master/mixture_of_experts/mixture_of_experts.py#L210">a previous transcription</a> - no there was not an error
 - [x] allow for different thresholds for second vs third routed expert
 - [x] add coordinate descent based routing
+- [x] make first naive non-optimized attempt at distributed code for mixture of experts
 
-- [ ] take care of scatter gather, and once done, port over to <a href="https://github.com/lucidrains/soft-moe-pytorch">soft moe</a>
+- [ ] distributed
+    - [ ] optimize
+    - [ ] make all distributed code pluggable, for different strategies
+    - [ ] figure out why there is tiny error in gradients
+    - [ ] support variable batch and sequence lengths
+
+- [ ] improvise a `Top2GatingWithCoordinateDescent` for `MoE` without `importance`
 
 ## Citations
 

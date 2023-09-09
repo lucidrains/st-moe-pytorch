@@ -13,6 +13,15 @@ from einops import rearrange, repeat, reduce, pack, unpack
 
 from colt5_attention import topk as maybe_differentiable_topk
 
+import torch.distributed as dist
+
+from st_moe_pytorch.distributed import (
+    AllGather,
+    split_by_rank,
+    gather_sizes,
+    has_only_one_value
+)
+
 # constants
 
 MIN_EXPERT_CAPACITY = 4
@@ -33,6 +42,15 @@ def default(val, default):
         return val
 
     return default() if callable(default) else default
+
+def divisible_by(num, den):
+    return (num % den) == 0
+
+def pack_one(t, pattern):
+    return pack([t], pattern)
+
+def unpack_one(t, ps, pattern):
+    return unpack(t, ps, pattern)[0]
 
 def cast_tuple(el, len = 1):
     return el if isinstance(el, tuple) else ((el,) * len)
@@ -120,23 +138,127 @@ class Expert(Module):
     def forward(self, x):
         return self.net(x)
 
-class Experts(Module):
+class Experts(nn.Module):
     def __init__(
         self,
-        dim,
-        num_experts = 16,
-        hidden_mult = 4
+        experts,
+        is_distributed = None
     ):
         super().__init__()
-        self.experts = ModuleList([Expert(dim = dim, hidden_mult = hidden_mult) for _ in range(num_experts)])
+        self.num_experts = len(experts)
+        self.experts = nn.ModuleList(experts)
 
-    def forward(self, x):
-        outputs = []
+        self.is_distributed = is_distributed
+        if not exists(self.is_distributed):
+            self.is_distributed = dist.is_initialized() and dist.get_world_size() > 1
 
-        for tokens, expert in zip(x, self.experts):
-            outputs.append(expert(tokens))
+        self.all_gather = AllGather()
+        self.register_buffer('dummy', torch.ones(1), persistent = False)
 
-        return torch.stack(outputs)
+    @property
+    def device(self):
+        return self.dummy.device
+
+    def all_experts_to_cpu_besides(self, selection):
+        if isinstance(selection, int):
+            experts = [self.experts[selection]]
+        if isinstance(selection, slice):
+            experts = self.experts[selection]
+        else:
+            experts = selection
+
+        experts_set = set(experts)
+
+        for expert in self.experts:
+            device = self.device if expert in experts_set else 'cpu'
+            expert.to(device)
+
+    def forward(
+        self,
+        x,
+        is_distributed = None
+    ):
+        """
+        einops notation:
+        b - batch
+        r - rank (device / machines)
+        e - experts
+        n - sequence (number of tokens per expert)
+        d - feature dimension
+        """
+
+        is_distributed = default(is_distributed, self.is_distributed)
+        shape, num_experts = x.shape, self.num_experts
+
+        # for now naively all gather across batch dimension if distributed, optimize later
+
+        if is_distributed:
+            seq_sizes = gather_sizes(x, dim = -2)
+            assert has_only_one_value(seq_sizes), 'number of tokens per expert must be the same'
+
+            x, batch_sizes = self.all_gather(x)
+
+            world_size = dist.get_world_size()
+            rank = dist.get_rank()
+        else:
+            world_size = 1
+            rank = 0
+
+        # the experts in use on the rank
+        # for now, make sure number of machines is right multiple
+
+        if world_size <= num_experts:
+            assert divisible_by(num_experts, world_size), 'if number of machines is less than the number of experts, the number of experts must be divisible by number of machines'
+            num_experts_per_rank = num_experts // world_size
+            expert_start_index = rank * num_experts_per_rank
+        else:
+            assert divisible_by(world_size, num_experts), 'if number of machines is greater than number of experts, machines must be divisible by number of experts, so experts are evenly distributed'
+            num_experts_per_rank = 1
+            expert_start_index = rank // num_experts
+
+        expert_slice = slice(expert_start_index, expert_start_index + num_experts_per_rank)
+
+        # if distributed, each machine only handles subset of experts and batch
+
+        x = rearrange(x, 'b e n d -> e b n d')
+
+        if is_distributed:
+            x, expert_batch_packed_shape = pack_one(x, '* n d')
+            x = rearrange(x, '(r eb) n d -> r eb n d', r = world_size)
+            x = split_by_rank(x)
+            x = rearrange(x, '(e b) n d -> e b n d', e = num_experts_per_rank)
+
+        # get the experts in use
+
+        self.all_experts_to_cpu_besides(expert_slice)
+
+        experts = self.experts[expert_slice]
+
+        # route tokens to appropriate experts
+
+        outs = []
+        for expert, expert_input in zip(experts, x):
+            out = expert(expert_input)
+            outs.append(out)
+
+        outs = torch.stack(outs)
+
+        # all gather across merged expert batches dimensions
+        # then split the batch dimension back
+
+        if is_distributed:
+            outs = rearrange(outs, 'e b n d -> (e b) n d')
+            outs, _ = self.all_gather(outs)
+            outs = unpack_one(outs, expert_batch_packed_shape, '* n d')
+
+        outs = rearrange(outs, 'e b n d -> b e n d')
+
+        if is_distributed:
+            outs = outs.split(batch_sizes.tolist())
+            outs = split_by_rank(outs)
+
+        assert outs.shape == shape
+        return outs
 
 # the below code is almost all transcribed from the official tensorflow version, from which the papers are written
 # https://github.com/tensorflow/tensor2tensor/blob/master/tensor2tensor/models/research/moe.py
@@ -364,7 +486,8 @@ class MoE(Module):
         experts: Optional[Module] = None,
         straight_through_dispatch_tensor = True,
         differentiable_topk = False,
-        differentiable_topk_fused = True
+        differentiable_topk_fused = True,
+        is_distributed = None
     ):
         super().__init__()
         self.dim = dim
@@ -382,7 +505,9 @@ class MoE(Module):
             capacity_factor_eval = capacity_factor_eval
         )
 
-        self.experts = default(experts, lambda: Experts(dim, num_experts = num_experts, hidden_mult = expert_hidden_mult))
+        experts = default(experts, lambda: [Expert(dim = dim, hidden_mult = expert_hidden_mult) for _ in range(num_experts)])
+
+        self.experts = Experts(experts, is_distributed = is_distributed)
 
         self.loss_coef = loss_coef
         self.router_z_loss_coef = router_z_loss_coef
@@ -392,17 +517,15 @@ class MoE(Module):
 
         # dispatch
 
-        expert_inputs = einsum('b n d, b n e c -> e b c d', x, dispatch_tensor)
+        expert_inputs = einsum('b n d, b n e c -> b e c d', x, dispatch_tensor)
 
         # feed the expert inputs through the experts.
 
-        expert_inputs, ps = pack_one(expert_inputs, 'e * d')
         expert_outputs = self.experts(expert_inputs)
-        expert_outputs = unpack_one(expert_outputs, ps, 'e * d')
 
         # combine
 
-        output = einsum('e b c d, b n e c -> b n d', expert_outputs, combine_tensor)
+        output = einsum('b e c d, b n e c -> b n d', expert_outputs, combine_tensor)
 
         # losses
 
