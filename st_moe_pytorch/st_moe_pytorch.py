@@ -46,6 +46,16 @@ def default(val, default):
 def divisible_by(num, den):
     return (num % den) == 0
 
+def chunk_num(num, chunks):
+    num_per_chunk, remainder = divmod(num, chunks)
+
+    out = []
+    for i in range(chunks):
+        n = num_per_chunk
+        out.append(n + int(i < remainder))
+
+    return out
+
 def pack_one(t, pattern):
     return pack([t], pattern)
 
@@ -205,18 +215,24 @@ class Experts(nn.Module):
             rank = 0
 
         # the experts in use on the rank
-        # for now, make sure number of machines is right multiple
 
-        if world_size <= num_experts:
-            assert divisible_by(num_experts, world_size), 'if number of machines is less than the number of experts, the number of experts must be divisible by number of machines'
-            num_experts_per_rank = num_experts // world_size
-            expert_start_index = rank * num_experts_per_rank
+        if is_distributed:
+            if world_size <= num_experts:
+                num_experts_across_ranks = chunk_num(num_experts, world_size)
+                start_indices = cumsum_exclusive(torch.tensor(num_experts_across_ranks), dim = -1)
+                num_experts_per_rank = num_experts_across_ranks[rank]
+                expert_start_index = start_indices[rank].item()
+            else:
+                # for now, make sure number of machines is right multiple
+
+                assert divisible_by(world_size, num_experts), 'if number of machines is greater than number of experts, machines must be divisible by number of experts, so experts are evenly distributed'
+                num_experts_per_rank = 1
+                expert_start_index = rank // num_experts
+
+            expert_slice = slice(expert_start_index, expert_start_index + num_experts_per_rank)
         else:
-            assert divisible_by(world_size, num_experts), 'if number of machines is greater than number of experts, machines must be divisible by number of experts, so experts are evenly distributed'
-            num_experts_per_rank = 1
-            expert_start_index = rank // num_experts
-
-        expert_slice = slice(expert_start_index, expert_start_index + num_experts_per_rank)
+            num_experts_per_rank = num_experts
+            expert_slice = slice(0, num_experts)
 
         # if distributed, each machine only handles subset of experts and batch
 
@@ -224,7 +240,14 @@ class Experts(nn.Module):
 
         if is_distributed:
             x, expert_batch_packed_shape = pack_one(x, '* n d')
-            x = rearrange(x, '(r eb) n d -> r eb n d', r = world_size)
+
+            if world_size <= num_experts:
+                x = rearrange(x, '(e b) n d -> e b n d', e = num_experts)
+                x = x.split(num_experts_across_ranks, dim = 0)
+                x = tuple(rearrange(t, 'e b n d -> (e b) n d') for t in x)
+            else:
+                x = rearrange(x, '(r eb) n d -> r eb n d', r = world_size)
+
             x, experts_per_rank_sizes = split_by_rank(x)
             x = rearrange(x, '(e b) n d -> e b n d', e = num_experts_per_rank)
 

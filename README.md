@@ -69,7 +69,10 @@ out, balance_loss, router_z_loss = moe_block(inputs) # (4, 1024, 512), (1,), (1,
 - [x] make first naive non-optimized attempt at distributed code for mixture of experts
 
 - [ ] distributed
+    - [x] handle any world size less than number of experts
+    - [ ] handle any world size greater than number of experts
     - [ ] optimize
+    - [ ] figure out what is faster, all gather, or broadcast with async followed by barrier
     - [ ] make all distributed code pluggable, for different strategies
     - [ ] figure out why there is tiny error in gradients
     - [ ] support variable batch and sequence lengths

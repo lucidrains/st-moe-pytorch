@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 setup(
   name = 'st-moe-pytorch',
   packages = find_packages(exclude=[]),
-  version = '0.0.25',
+  version = '0.0.27',
   license='MIT',
   description = 'ST - Mixture of Experts - Pytorch',
   author = 'Phil Wang',
