@@ -227,7 +227,7 @@ class Experts(nn.Module):
 
                 assert divisible_by(world_size, num_experts), 'if number of machines is greater than number of experts, machines must be divisible by number of experts, so experts are evenly distributed'
                 num_experts_per_rank = 1
-                expert_start_index = rank // num_experts
+                expert_start_index = rank // (world_size // num_experts)
 
             expert_slice = slice(expert_start_index, expert_start_index + num_experts_per_rank)
         else:
