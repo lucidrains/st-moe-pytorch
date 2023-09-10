@@ -76,8 +76,8 @@ def start(
     cleanup()
 
 if __name__ == '__main__':
-    world_size = 8
-    num_experts = 8
+    world_size = 9
+    num_experts = 4
     batch_size = 2
     batch_size_var_len = False
 
