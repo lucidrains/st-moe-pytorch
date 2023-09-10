@@ -96,11 +96,12 @@ class SplitByRankFunction(Function):
         else:
             sizes = (x.shape[1],) * x.shape[0]
 
-        ctx.sizes = torch.tensor(sizes, device = out.device, dtype = torch.long)
-        return out
+        sizes = torch.tensor(sizes, device = out.device, dtype = torch.long)
+        ctx.sizes = sizes
+        return out, sizes
 
     @staticmethod
-    def backward(ctx, grads):
+    def backward(ctx, grads, _):
         grads = rearrange(grads, '... -> 1 ...')
         grads = all_gather_variable_dim(grads, sizes = ctx.sizes)
         return grads

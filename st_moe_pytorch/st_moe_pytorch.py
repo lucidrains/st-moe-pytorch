@@ -225,7 +225,7 @@ class Experts(nn.Module):
         if is_distributed:
             x, expert_batch_packed_shape = pack_one(x, '* n d')
             x = rearrange(x, '(r eb) n d -> r eb n d', r = world_size)
-            x = split_by_rank(x)
+            x, experts_per_rank_sizes = split_by_rank(x)
             x = rearrange(x, '(e b) n d -> e b n d', e = num_experts_per_rank)
 
         # get the experts in use
@@ -248,14 +248,14 @@ class Experts(nn.Module):
 
         if is_distributed:
             outs = rearrange(outs, 'e b n d -> (e b) n d')
-            outs, _ = self.all_gather(outs)
+            outs, _ = self.all_gather(outs, sizes = experts_per_rank_sizes)
             outs = unpack_one(outs, expert_batch_packed_shape, '* n d')
 
         outs = rearrange(outs, 'e b n d -> b e n d')
 
         if is_distributed:
             outs = outs.split(batch_sizes.tolist())
-            outs = split_by_rank(outs)
+            outs, _ = split_by_rank(outs)
 
         assert outs.shape == shape
         return outs
