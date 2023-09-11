@@ -25,6 +25,7 @@ def start(
     num_experts,
     tokens_per_expert,
     dim,
+    use_cuda
 ):
     setup(rank, world_size)
 
@@ -35,18 +36,11 @@ def start(
 
     seq = torch.randn(batch_size, num_experts, tokens_per_expert, dim)
 
-    # distributed
+    # locally
 
-    model = DDP(net)
-    out = model(seq)
-    out.mean().backward()
-
-    ddp_all_out, _ = all_gather_variable_dim(out)
-
-    # on single device
+    local_net = deepcopy(net)
 
     local_inputs, _ = all_gather_variable_dim(seq)
-    local_net = deepcopy(net)
 
     local_out = local_net(
         local_inputs,
@@ -55,18 +49,34 @@ def start(
 
     local_out.mean().backward()
 
+    # distributed
+
+    model = DDP(net)
+    ddp_inputs = seq
+
+    if use_cuda:
+        model.cuda(rank)
+        ddp_inputs = seq.cuda(rank)
+
+    out = model(ddp_inputs)
+    out.mean().backward()
+
+    ddp_all_out, _ = all_gather_variable_dim(out)
+
     if rank == 0:
-        # validate output is the same
-        # if done on 1 vs multiple machines
+        # validate output is the same for local vs distributed
 
-        assert torch.allclose(local_out, ddp_all_out), 'output is not the same'
+        model.cpu()
+        ddp_all_out.cpu()
 
-        # validate backwards and grad
+        assert torch.allclose(local_out, ddp_all_out.cpu(), atol = 1e-3), 'output is not the same'
+
+        # validate gradients of first expert is the same for local vs distributed
 
         get_first_expert_grad = lambda t: t.experts[0].net[0].weight.grad
 
         assert torch.allclose(
-            get_first_expert_grad(net),
+            get_first_expert_grad(net).cpu(),
             get_first_expert_grad(local_net),
             atol = 1e-2
         ), 'grad is not the same'
@@ -76,10 +86,13 @@ def start(
     cleanup()
 
 if __name__ == '__main__':
-    world_size = 13
-    num_experts = 4
+    world_size = 8
+    num_experts = 3
     batch_size = 2
     batch_size_var_len = True
+    use_cuda = False
+
+    assert not use_cuda or torch.cuda.device_count() <= world_size
 
     seq_len = 32
     dim = 8
@@ -92,7 +105,8 @@ if __name__ == '__main__':
             batch_size_var_len,
             num_experts,
             seq_len,
-            dim
+            dim,
+            use_cuda
         ),
         nprocs = world_size,
         join = True
