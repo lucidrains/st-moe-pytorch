@@ -45,21 +45,21 @@ def start(
 
     # on single device
 
-    all_inputs, _ = all_gather_variable_dim(seq)
-    copied_net = deepcopy(net)
+    local_inputs, _ = all_gather_variable_dim(seq)
+    local_net = deepcopy(net)
 
-    single_out = copied_net(
-        all_inputs,
+    local_out = local_net(
+        local_inputs,
         is_distributed = False
     )
 
-    single_out.mean().backward()
+    local_out.mean().backward()
 
     if rank == 0:
         # validate output is the same
         # if done on 1 vs multiple machines
 
-        assert torch.allclose(single_out, ddp_all_out), 'output is not the same'
+        assert torch.allclose(local_out, ddp_all_out), 'output is not the same'
 
         # validate backwards and grad
 
@@ -67,19 +67,19 @@ def start(
 
         assert torch.allclose(
             get_first_expert_grad(net),
-            get_first_expert_grad(copied_net),
+            get_first_expert_grad(local_net),
             atol = 1e-2
         ), 'grad is not the same'
 
-        print('✅')
+        print('✅ outputs and gradients are same between local and ddp')
 
     cleanup()
 
 if __name__ == '__main__':
-    world_size = 9
+    world_size = 13
     num_experts = 4
     batch_size = 2
-    batch_size_var_len = False
+    batch_size_var_len = True
 
     seq_len = 32
     dim = 8

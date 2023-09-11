@@ -72,7 +72,9 @@ out, balance_loss, router_z_loss = moe_block(inputs) # (4, 1024, 512), (1,), (1,
     - [x] handle any world size less than number of experts
     - [x] handle any world size greater than number of experts - for now, just have remainder machines do nothing
     - [x] support variable batch sizes
-    - [ ] support variable seq lengths
+    - [x] support variable seq lengths
+    - [ ] figure out how to move assert.py to pytests
+    - [ ] simplify the variable sequence length test code from another folder and move in so other researchers gain confidence
     - [ ] optimize
     - [ ] figure out what is faster, all gather, or broadcast with async followed by barrier
     - [ ] make all distributed code pluggable, for different strategies

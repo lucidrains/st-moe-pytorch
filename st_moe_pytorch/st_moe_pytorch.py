@@ -152,17 +152,25 @@ class Experts(nn.Module):
     def __init__(
         self,
         experts,
-        is_distributed = None
+        is_distributed = None,
+        allow_var_seq_len = False # whether to handle variable sequence length
     ):
         super().__init__()
         self.num_experts = len(experts)
         self.experts = nn.ModuleList(experts)
+
+        # distributed related settings
 
         self.is_distributed = is_distributed
         if not exists(self.is_distributed):
             self.is_distributed = dist.is_initialized() and dist.get_world_size() > 1
 
         self.all_gather = AllGather()
+
+        self.allow_var_seq_len = allow_var_seq_len
+
+        # device tracker, since need to manually move experts not in use to CPU in distributed
+
         self.register_buffer('dummy', torch.ones(1), persistent = False)
 
     @property
@@ -197,25 +205,41 @@ class Experts(nn.Module):
         d - feature dimension
         """
 
+        # declare some variables
+
         is_distributed = default(is_distributed, self.is_distributed)
         shape, num_experts = x.shape, self.num_experts
+        seq_len = shape[-2]
 
         # for now naively all gather across batch dimension if distributed, optimize later
 
+        world_size = 1
+        rank = 0
+
         if is_distributed:
             seq_sizes = gather_sizes(x, dim = -2)
-            assert has_only_one_value(seq_sizes), 'number of tokens per expert must be the same'
+            var_seq_len = not has_only_one_value(seq_sizes)
+
+            assert self.allow_var_seq_len or not var_seq_len, 'number of tokens per expert must be the same - if you want the framework to handle it, set `allow_var_seq_len = True` on `Experts`'
+
+            # if variable sequence length, pad
+
+            if var_seq_len:
+                max_seq_size = seq_sizes.amax().item()
+                x = pad_dim_to(x, max_seq_size, dim = -2)
+
+            # gather and concat across batches, accounting for variable batch sizes
 
             x, batch_sizes = self.all_gather(x)
             total_batch_size = batch_sizes.sum().item()
 
             world_size = dist.get_world_size()
             rank = dist.get_rank()
-        else:
-            world_size = 1
-            rank = 0
 
         # the experts in use on the rank
+
+        num_experts_per_rank = num_experts
+        expert_slice = slice(0, num_experts)
 
         if is_distributed:
             if world_size <= num_experts:
@@ -245,9 +269,6 @@ class Experts(nn.Module):
             assert len(num_experts_batches_across_ranks) == world_size
 
             expert_slice = slice(expert_start_index, expert_start_index + num_experts_per_rank)
-        else:
-            num_experts_per_rank = num_experts
-            expert_slice = slice(0, num_experts)
 
         # if distributed, each machine only handles subset of experts and batch
 
@@ -281,7 +302,7 @@ class Experts(nn.Module):
         if len(outs) > 0:
             outs = torch.stack(outs)
         else:
-            outs = torch.empty_like(x).requires_grad_()
+            outs = torch.empty_like(x, requires_grad = self.training)
 
         # all gather across merged expert batches dimensions
         # then split the batch dimension back
@@ -296,6 +317,9 @@ class Experts(nn.Module):
         if is_distributed:
             outs = outs.split(batch_sizes.tolist())
             outs, _ = split_by_rank(outs)
+
+            # account for padded sequence length
+            outs = outs[..., :seq_len, :]
 
         assert outs.shape == shape
         return outs
@@ -527,7 +551,8 @@ class MoE(Module):
         straight_through_dispatch_tensor = True,
         differentiable_topk = False,
         differentiable_topk_fused = True,
-        is_distributed = None
+        is_distributed = None,
+        allow_var_seq_len = False
     ):
         super().__init__()
         self.dim = dim
@@ -547,7 +572,11 @@ class MoE(Module):
 
         experts = default(experts, lambda: [Expert(dim = dim, hidden_mult = expert_hidden_mult) for _ in range(num_experts)])
 
-        self.experts = Experts(experts, is_distributed = is_distributed)
+        self.experts = Experts(
+            experts,
+            is_distributed = is_distributed,
+            allow_var_seq_len = allow_var_seq_len
+        )
 
         self.loss_coef = loss_coef
         self.router_z_loss_coef = router_z_loss_coef
