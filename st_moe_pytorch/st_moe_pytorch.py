@@ -28,6 +28,7 @@ MIN_EXPERT_CAPACITY = 4
 
 MixtureOfExpertsReturn = namedtuple('MixtureOfExpertsReturn', [
     'outputs',
+    'total_aux_loss',
     'balance_loss',
     'router_z_loss'
 ])
@@ -545,7 +546,7 @@ class MoE(Module):
         capacity_factor_train = 1.25,
         capacity_factor_eval = 2.,
         gating_top_n = 2,
-        loss_coef = 1e-2,
+        balance_loss_coef = 1e-2,
         router_z_loss_coef = 1e-3,
         experts: Optional[Module] = None,
         straight_through_dispatch_tensor = True,
@@ -578,7 +579,7 @@ class MoE(Module):
             allow_var_seq_len = allow_var_seq_len
         )
 
-        self.loss_coef = loss_coef
+        self.balance_loss_coef = balance_loss_coef
         self.router_z_loss_coef = router_z_loss_coef
 
     def forward(self, x):
@@ -598,10 +599,14 @@ class MoE(Module):
 
         # losses
 
-        balance_loss = loss * self.loss_coef
+        balance_loss = loss * self.balance_loss_coef
         router_z_loss = router_z_loss * self.router_z_loss_coef
 
-        return MixtureOfExpertsReturn(output, balance_loss, router_z_loss)
+        # combine the losses
+
+        total_aux_loss = balance_loss + router_z_loss
+
+        return MixtureOfExpertsReturn(output, total_aux_loss, balance_loss, router_z_loss)
 
 # sparse moe block
 # in particular, they found that adding a feedforward before or after greatly stabilized the training and improved results
@@ -636,7 +641,7 @@ class SparseMoEBlock(Module):
 
         residual = x
 
-        moe_out, balance_loss, router_z_loss = self.moe(self.moe_prenorm(x))
+        moe_out, total_aux_loss, balance_loss, router_z_loss = self.moe(self.moe_prenorm(x))
 
         x = moe_out + residual
 
@@ -645,4 +650,4 @@ class SparseMoEBlock(Module):
         if exists(self.ff_after):
             x = self.ff_after(x) + x
 
-        return MixtureOfExpertsReturn(x, balance_loss, router_z_loss)
+        return MixtureOfExpertsReturn(x, total_aux_loss, balance_loss, router_z_loss)

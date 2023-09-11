@@ -34,12 +34,12 @@ moe = MoE(
     threshold_eval = 0.2,
     capacity_factor_train = 1.25,   # experts have fixed capacity per batch. we need some extra capacity in case gating is not perfectly balanced.
     capacity_factor_eval = 2.,      # capacity_factor_* should be set to a value >=1
-    loss_coef = 1e-2,               # multiplier on the auxiliary expert balancing auxiliary loss
+    balance_loss_coef = 1e-2,       # multiplier on the auxiliary expert balancing auxiliary loss
     router_z_loss_coef = 1e-3,      # loss weight for router z-loss
 )
 
 inputs = torch.randn(4, 1024, 512)
-out, balance_loss, router_z_loss = moe(inputs) # (4, 1024, 512), (1,), (1,)
+out, total_aux_loss, balance_loss, router_z_loss = moe(inputs) # (4, 1024, 512), (1,), (1,), (1,)
 
 # for the entire mixture of experts block, in context of transformer
 
@@ -51,7 +51,11 @@ moe_block = SparseMoEBlock(
     add_ff_after = True
 )
 
-out, balance_loss, router_z_loss = moe_block(inputs) # (4, 1024, 512), (1,), (1,)
+out, total_aux_loss, balance_loss, router_z_loss = moe_block(inputs) # (4, 1024, 512), (1,) (1,), (1,)
+
+# the total auxiliary loss will need to be summed and then added to the main loss
+
+# the other two losses are the breakdown, weighed by the coefficients
 ```
 
 ## Todo
