@@ -55,7 +55,7 @@ out, total_aux_loss, balance_loss, router_z_loss = moe_block(inputs) # (4, 1024,
 
 # the total auxiliary loss will need to be summed and then added to the main loss
 
-# the other two losses are the breakdown, weighed by the coefficients
+# the other two losses are the unweighted breakdown for logging purposes
 ```
 
 ## Todo
