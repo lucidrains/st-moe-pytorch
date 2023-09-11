@@ -583,7 +583,7 @@ class MoE(Module):
         self.router_z_loss_coef = router_z_loss_coef
 
     def forward(self, x):
-        dispatch_tensor, combine_tensor, loss, router_z_loss = self.gate(x)
+        dispatch_tensor, combine_tensor, balance_loss, router_z_loss = self.gate(x)
 
         # dispatch
 
@@ -599,12 +599,12 @@ class MoE(Module):
 
         # losses
 
-        balance_loss = loss * self.balance_loss_coef
-        router_z_loss = router_z_loss * self.router_z_loss_coef
+        weighted_balance_loss = balance_loss * self.balance_loss_coef
+        weighted_router_z_loss = router_z_loss * self.router_z_loss_coef
 
         # combine the losses
 
-        total_aux_loss = balance_loss + router_z_loss
+        total_aux_loss = weighted_balance_loss + weighted_router_z_loss
 
         return MixtureOfExpertsReturn(output, total_aux_loss, balance_loss, router_z_loss)
 
