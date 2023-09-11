@@ -71,11 +71,12 @@ out, balance_loss, router_z_loss = moe_block(inputs) # (4, 1024, 512), (1,), (1,
 - [ ] distributed
     - [x] handle any world size less than number of experts
     - [x] handle any world size greater than number of experts - for now, just have remainder machines do nothing
+    - [x] support variable batch sizes
+    - [ ] support variable seq lengths
     - [ ] optimize
     - [ ] figure out what is faster, all gather, or broadcast with async followed by barrier
     - [ ] make all distributed code pluggable, for different strategies
     - [ ] figure out why there is tiny error in gradients
-    - [ ] support variable batch and sequence lengths
 
 - [ ] improvise a `Top2GatingWithCoordinateDescent` for `MoE` without `importance`
 
