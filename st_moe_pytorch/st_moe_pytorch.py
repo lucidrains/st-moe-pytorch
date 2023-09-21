@@ -420,11 +420,13 @@ class TopNGating(Module):
 
         gate_logits = self.to_gates(x)
 
-        if noise_gates:
-            noise = gumbel_noise(gate_logits)
-            gate_logits = gate_logits + noise * noise_mult
+        maybe_noised_gate_logits = gate_logits
 
-        raw_gates = gate_logits.softmax(dim = -1)
+        if noise_gates:
+            noise = gumbel_noise(maybe_noised_gate_logits)
+            maybe_noised_gate_logits = maybe_noised_gate_logits + noise * noise_mult
+
+        raw_gates = maybe_noised_gate_logits.softmax(dim = -1)
 
         # find top N experts per position
 
