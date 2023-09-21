@@ -83,6 +83,13 @@ def cumsum_exclusive(t, dim = -3):
     pre_padding = (0, 0) * num_pad_dims
     return F.pad(t, (*pre_padding, 1, -1)).cumsum(dim = dim)
 
+def log(t, eps = 1e-20):
+    return torch.log(t.clamp(min = eps))
+
+def gumbel_noise(t):
+    noise = torch.zeros_like(t).uniform_(0, 1)
+    return -log(-log(noise))
+
 # pytorch one hot throws an error if there are out of bound indices.
 # tensorflow, in contrast, does not throw an error
 
@@ -378,7 +385,12 @@ class TopNGating(Module):
         self.straight_through_dispatch_tensor = straight_through_dispatch_tensor
         self.register_buffer('zero', torch.zeros((1,)), persistent = False)
 
-    def forward(self, x):
+    def forward(
+        self,
+        x,
+        noise_gates = False,
+        noise_mult = 1.
+    ):
         """
         einstein notation:
 
@@ -407,6 +419,11 @@ class TopNGating(Module):
         # gate logits and gates
 
         gate_logits = self.to_gates(x)
+
+        if noise_gates:
+            noise = gumbel_noise(gate_logits)
+            gate_logits = gate_logits + noise * noise_mult
+
         raw_gates = gate_logits.softmax(dim = -1)
 
         # find top N experts per position
@@ -582,8 +599,13 @@ class MoE(Module):
         self.balance_loss_coef = balance_loss_coef
         self.router_z_loss_coef = router_z_loss_coef
 
-    def forward(self, x):
-        dispatch_tensor, combine_tensor, balance_loss, router_z_loss = self.gate(x)
+    def forward(
+        self,
+        x,
+        noise_gates = False,
+        noise_mult = 1.
+    ):
+        dispatch_tensor, combine_tensor, balance_loss, router_z_loss = self.gate(x, noise_gates = noise_gates, noise_mult = noise_mult)
 
         # dispatch
 
@@ -630,7 +652,12 @@ class SparseMoEBlock(Module):
         self.ff_before = Expert(dim, prenorm = True) if add_ff_before else None
         self.ff_after = Expert(dim, prenorm = True) if add_ff_after else None
 
-    def forward(self, x):
+    def forward(
+        self,
+        x,
+        noise_gates = False,
+        noise_mult = 1.
+    ):
 
         # feedforward before
 
@@ -641,7 +668,7 @@ class SparseMoEBlock(Module):
 
         residual = x
 
-        moe_out, total_aux_loss, balance_loss, router_z_loss = self.moe(self.moe_prenorm(x))
+        moe_out, total_aux_loss, balance_loss, router_z_loss = self.moe(self.moe_prenorm(x), noise_gates = noise_gates, noise_mult = noise_mult)
 
         x = moe_out + residual
 
