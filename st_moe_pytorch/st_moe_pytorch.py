@@ -19,6 +19,7 @@ from st_moe_pytorch.distributed import (
     AllGather,
     split_by_rank,
     gather_sizes,
+    pad_dim_to,
     has_only_one_value
 )
 
