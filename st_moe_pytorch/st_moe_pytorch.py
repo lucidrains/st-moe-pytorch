@@ -67,12 +67,6 @@ def unpack_one(t, ps, pattern):
 def cast_tuple(el, len = 1):
     return el if isinstance(el, tuple) else ((el,) * len)
 
-def pack_one(t, pattern):
-    return pack([t], pattern)
-
-def unpack_one(t, ps, pattern):
-    return unpack(t, ps, pattern)[0]
-
 def Sequential(*modules):
     return nn.Sequential(*filter(exists, modules))
 
