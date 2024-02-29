@@ -87,7 +87,8 @@ class AllGather(nn.Module):
 
 class SplitByRankFunction(Function):
     @staticmethod
-    def forward(ctx, x):
+    def forward(ctx, x, split_size, dim):
+        x = x.split(split_size, dim = dim)
         rank = dist.get_rank()
         out = x[rank]
 
@@ -103,7 +104,10 @@ class SplitByRankFunction(Function):
     @staticmethod
     def backward(ctx, grads, _):
         grads = rearrange(grads, '... -> 1 ...')
-        grads = all_gather_variable_dim(grads, sizes = ctx.sizes)
-        return grads
+        grads, *_ = all_gather_variable_dim(grads, sizes = ctx.sizes)
+        return grads, None, None
 
-split_by_rank = SplitByRankFunction.apply
+_split_by_rank = SplitByRankFunction.apply
+
+def split_by_rank(x, sizes, dim = 0):
+    return _split_by_rank(x, sizes, dim)

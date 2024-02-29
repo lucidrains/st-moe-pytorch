@@ -278,8 +278,7 @@ class Experts(nn.Module):
         if is_distributed:
             x, expert_batch_packed_shape = pack_one(x, '* n d')
 
-            x = x.split(num_experts_batches_across_ranks, dim = 0)
-            x, experts_per_rank_sizes = split_by_rank(x)
+            x, experts_per_rank_sizes = split_by_rank(x, num_experts_batches_across_ranks, dim = 0)
 
             if num_experts_per_rank > 0:
                 x = rearrange(x, '(e b) n d -> e b n d', e = num_experts_per_rank)
@@ -316,8 +315,7 @@ class Experts(nn.Module):
         outs = rearrange(outs, 'e b n d -> b e n d')
 
         if is_distributed:
-            outs = outs.split(batch_sizes.tolist())
-            outs, _ = split_by_rank(outs)
+            outs, _ = split_by_rank(outs, batch_sizes.tolist(), dim = 0)
 
             # account for padded sequence length
             outs = outs[..., :seq_len, :]
