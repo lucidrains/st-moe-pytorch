@@ -486,7 +486,7 @@ class TopNGating(Module):
             mask[n] *= (position_in_expert < expert_capacity_f).float()
 
             # How many examples in this sequence go to this expert - needed for the next iteration as offset
-            prev_expert_count = reduce(mask[n], '... n e -> ... 1 e', 'sum')
+            prev_expert_count = reduce(mask[n], '... n e -> ... 1 e', 'sum') + prev_expert_count
 
             # (batch, sequence)
             position_in_expert = reduce(position_in_expert, '... n e -> ... n', 'sum')
