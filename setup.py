@@ -18,7 +18,8 @@ setup(
   install_requires=[
     'beartype',
     'CoLT5-attention>=0.10.15',
-    'einops>=0.6',
+    'einops>=0.8',
+    'einx>=0.3.0',
     'torch>=2.0',
   ],
   classifiers=[

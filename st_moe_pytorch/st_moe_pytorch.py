@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 from functools import partial
 from collections import namedtuple
-from typing import Optional, Tuple, Union
+from typing import Tuple
 
 import torch
 from torch.nn import Module, ModuleList
@@ -9,6 +11,7 @@ import torch.nn.functional as F
 
 from beartype import beartype
 
+import einx
 from einops import rearrange, repeat, reduce, pack, unpack
 
 from colt5_attention import topk as maybe_differentiable_topk
@@ -151,7 +154,7 @@ class Expert(Module):
     def forward(self, x):
         return self.net(x)
 
-class Experts(nn.Module):
+class Experts(Module):
     def __init__(
         self,
         experts,
@@ -160,7 +163,7 @@ class Experts(nn.Module):
     ):
         super().__init__()
         self.num_experts = len(experts)
-        self.experts = nn.ModuleList(experts)
+        self.experts = ModuleList(experts)
 
         # distributed related settings
 
@@ -341,8 +344,8 @@ class TopNGating(Module):
         num_gates,
         eps = 1e-9,
         top_n = 2,
-        threshold_train: Union[float, Tuple[float, ...]] = 0.2,
-        threshold_eval: Union[float, Tuple[float, ...]] = 0.2,
+        threshold_train: float | Tuple[float, ...] = 0.2,
+        threshold_eval: float | Tuple[float, ...] = 0.2,
         capacity_factor_train = 1.25,
         capacity_factor_eval = 2.,
         straight_through_dispatch_tensor = True,
@@ -393,6 +396,7 @@ class TopNGating(Module):
         n - sequence
         e - experts
         k - top-n experts
+        c - capacity
         """
 
         *_, b, group_size, dim, dtype, top_n, num_gates, eps = *x.shape, x.dtype, self.top_n, self.num_gates, self.eps
@@ -460,8 +464,7 @@ class TopNGating(Module):
 
         probs = torch.zeros_like(gates).uniform_(0., 1.)
 
-        threshold = rearrange(threshold, 'k -> k 1 1')
-        should_route = probs < (gates / threshold.clamp(min = eps))
+        should_route = probs < einx.divide('k b n, k -> k b n', gates, threshold.clamp(min = eps))
 
         # tokens should always be routed to first expert
         # threshold for first expert already set to very small number, but just in case
@@ -503,19 +506,15 @@ class TopNGating(Module):
 
         # (batch, sequence, experts, expert_capacity)
 
-        N = None
+        combine_tensor = einx.multiply(
+            'k b n, k b n, k b n e, k b n c -> k b n e c',
+            gates,
+            mask_flat,
+            one_hot_gate_indices,
+            safe_one_hot(positions.long(), expert_capacity)
+        )
 
-        gates = gates[..., N, N]
-        mask_flat = mask_flat[..., N, N]
-        one_hot_gate_indices = one_hot_gate_indices[..., N]
-        safe_one_hot_gates = safe_one_hot(positions.long(), expert_capacity)[..., N, :]
-
-        combine_tensor = reduce(
-            gates
-            * mask_flat
-            * one_hot_gate_indices
-            * safe_one_hot_gates
-        , 'k ... -> ...', 'sum')
+        combine_tensor = reduce(combine_tensor, 'k b n e c -> b n e c', 'sum')
 
         # dispatch tensor
 
@@ -562,7 +561,7 @@ class MoE(Module):
         gating_top_n = 2,
         balance_loss_coef = 1e-2,
         router_z_loss_coef = 1e-3,
-        experts: Optional[Module] = None,
+        experts: Module | None = None,
         straight_through_dispatch_tensor = True,
         differentiable_topk = False,
         differentiable_topk_fused = True,
